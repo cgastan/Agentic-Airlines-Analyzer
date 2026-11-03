@@ -34,8 +34,6 @@ class StakeholderImpact(BaseModel):
 
 class ChangeRequestPayload(BaseModel):
     """Valida la solicitud de cambio enviada por el Business Analyst."""
-    request_id: str = Field(...,
-                            description="Identificador único de la solicitud de cambio.")
     analyst_prompt: str = Field(
         ..., description="Descripción del cambio propuesto por el analista.")
     target_system: Optional[str] = Field(
@@ -43,7 +41,6 @@ class ChangeRequestPayload(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    request_id: str
     message: str
     target_system: Optional[str] = None
 

@@ -1,6 +1,7 @@
 # routers/analysis.py
 
 import os
+import uuid
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
@@ -11,6 +12,11 @@ from services.chunking import build_chunks_from_documents
 from services.embeddings import embed_chunks
 
 router = APIRouter(prefix="/api", tags=["Impact Analysis"])
+
+
+def create_request_id() -> str:
+    return f"CHG-{uuid.uuid4().hex[:12].upper()}"
+
 
 # Directorio de documentos iniciales de Agentic Airlines SRL
 DATA_DIR = Path("data")
@@ -66,7 +72,6 @@ stakeholder_chunks = embed_chunks(
 
 @router.post("/analyze", response_model=ImpactReportResponse)
 async def analyze_change_request(
-    request_id: str = Form(..., description="ID único de la solicitud"),
     analyst_prompt: str = Form(...,
                                description="Descripción del cambio propuesto"),
     file: UploadFile = File(
@@ -115,7 +120,7 @@ async def analyze_change_request(
             tech_store=active_tech_store,
             stakeholder_store=active_stakeholder_store
         )
-        report["request_id"] = request_id
+        report["request_id"] = create_request_id()
 
         return ImpactReportResponse.model_validate(report)
     except HTTPException:
@@ -138,7 +143,7 @@ async def chat(payload: ChatRequest):
             tech_store=tech_chunks,
             stakeholder_store=stakeholder_chunks
         )
-        report["request_id"] = payload.request_id
+        report["request_id"] = create_request_id()
         return ImpactReportResponse.model_validate(report)
     except Exception as e:
         raise HTTPException(
@@ -165,7 +170,7 @@ async def chat_stream(payload: ChatRequest):
             tech_store=tech_chunks,
             stakeholder_store=stakeholder_chunks
         )
-        report["request_id"] = payload.request_id
+        report["request_id"] = create_request_id()
         validated = ImpactReportResponse.model_validate(report)
         yield json.dumps(
             {"type": "complete", "report": validated.model_dump(mode="json")},

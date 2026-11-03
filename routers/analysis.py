@@ -3,8 +3,9 @@
 import os
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from pypdf import PdfReader
-from schemas.models import ImpactReportResponse
+from schemas.models import ChatRequest, ImpactReportResponse
 from services.agent_flow import run_agent_workflow
 from services.chunking import build_chunks_from_documents
 from services.embeddings import embed_chunks
@@ -37,8 +38,18 @@ def load_initial_pdfs() -> tuple[list[dict], list[dict]]:
 
             doc_item = {"id": file_path.name,
                         "title": file_path.stem, "text": text}
-            # Clasificamos según el nombre del archivo (ej: si contiene 'stakeholder' o 'arch')
-            if "stakeholder" in file_path.name.lower() or "policy" in file_path.name.lower():
+            # Clasificamos documentos operativos en español e inglés.
+            filename = file_path.name.lower()
+            operational_markers = (
+                "stakeholder",
+                "policy",
+                "politica",
+                "política",
+                "procedimiento",
+                "feedback",
+                "riesgo",
+            )
+            if any(marker in filename for marker in operational_markers):
                 stakeholder_notes.append(doc_item)
             else:
                 tech_docs.append(doc_item)
@@ -71,14 +82,24 @@ async def analyze_change_request(
         active_stakeholder_store = list(stakeholder_chunks)
 
         # Si el usuario subió un archivo en tiempo de ejecución, lo procesamos al vuelo
-        if file and file.filename.endswith(".pdf"):
+        if file:
             file_bytes = await file.read()
-            # Guardar temporalmente o leer desde memoria con pypdf
-            import io
-            reader = PdfReader(io.BytesIO(file_bytes))
-            uploaded_text = ""
-            for page in reader.pages:
-                uploaded_text += page.extract_text() or ""
+            extension = Path(file.filename).suffix.lower()
+            if extension == ".pdf":
+                import io
+                reader = PdfReader(io.BytesIO(file_bytes))
+                uploaded_text = "".join(
+                    page.extract_text() or "" for page in reader.pages)
+            elif extension in {".txt", ".md"}:
+                uploaded_text = file_bytes.decode("utf-8-sig")
+            else:
+                raise HTTPException(
+                    status_code=415,
+                    detail="Formato no admitido. Use PDF, TXT o MD.")
+
+            if not uploaded_text.strip():
+                raise HTTPException(
+                    status_code=422, detail="El documento está vacío o no contiene texto.")
 
             uploaded_doc = [{"id": file.filename,
                              "title": file.filename, "text": uploaded_text}]
@@ -89,23 +110,65 @@ async def analyze_change_request(
             active_tech_store.extend(uploaded_chunks)
 
         # Ejecutar el flujo completo del agente (con los 7 pasos requeridos)
-        report_text = run_agent_workflow(
+        report = run_agent_workflow(
             analyst_prompt=analyst_prompt,
             tech_store=active_tech_store,
             stakeholder_store=active_stakeholder_store
         )
+        report["request_id"] = request_id
 
-        return ImpactReportResponse(
-            request_id=request_id,
-            technical_changes=[
-                "Actualización evaluada mediante RAG y archivos adjuntos"],
-            risk_level="Medio-Alto",
-            affected_stakeholders=["Operaciones de Vuelo",
-                                   "Agentes de Tierra", "Pasajeros"],
-            required_mitigations=[
-                "Validar dependencias técnicas y actualizar documentación de capacitación"],
-            summary_report=report_text
-        )
+        return ImpactReportResponse.model_validate(report)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Error interno ejecutando el agente: {str(e)}")
+
+
+@router.post("/chat", response_model=ImpactReportResponse)
+async def chat(payload: ChatRequest):
+    """Consulta conversacional que reutiliza el mismo flujo de análisis de impacto."""
+    try:
+        prompt = payload.message
+        if payload.target_system:
+            prompt = f"Sistema objetivo: {payload.target_system}. {prompt}"
+
+        report = run_agent_workflow(
+            analyst_prompt=prompt,
+            tech_store=tech_chunks,
+            stakeholder_store=stakeholder_chunks
+        )
+        report["request_id"] = payload.request_id
+        return ImpactReportResponse.model_validate(report)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error interno ejecutando el agente: {str(e)}")
+
+
+@router.post("/chat/stream")
+async def chat_stream(payload: ChatRequest):
+    """Transmite etapas del agente y el reporte final como JSON Lines."""
+    async def event_stream():
+        import json
+
+        for stage in (
+            "initialize",
+            "retrieve_specifications_rag",
+            "retrieve_stakeholder_notes_rag",
+            "grade_context",
+        ):
+            yield json.dumps(
+                {"type": "progress", "step": stage}, ensure_ascii=False) + "\n"
+
+        report = run_agent_workflow(
+            analyst_prompt=payload.message,
+            tech_store=tech_chunks,
+            stakeholder_store=stakeholder_chunks
+        )
+        report["request_id"] = payload.request_id
+        validated = ImpactReportResponse.model_validate(report)
+        yield json.dumps(
+            {"type": "complete", "report": validated.model_dump(mode="json")},
+            ensure_ascii=False) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")

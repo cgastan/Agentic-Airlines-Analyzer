@@ -4,14 +4,33 @@ from typing import List
 
 
 def chunk_text(text: str, chunk_size: int = 500, max_paragraphs: int = 2, overlap: int = 50) -> list[str]:
-    """Split text into small paragraph-based chunks."""
-    paragraphs = [paragraph.strip()
-                  for paragraph in text.split('\n\n') if paragraph.strip()]
-    chunks = []
+    """Divide texto en chunks por tamaño, conservando solapamiento entre bloques."""
+    normalized = "\n\n".join(
+        paragraph.strip()
+        for paragraph in text.splitlines()
+        if paragraph.strip()
+    )
+    if not normalized:
+        return []
 
-    for start in range(0, len(paragraphs), max_paragraphs):
-        group = paragraphs[start:start + max_paragraphs]
-        chunks.append('\n\n'.join(group))
+    overlap = max(0, min(overlap, chunk_size - 1))
+    chunks = []
+    start = 0
+
+    while start < len(normalized):
+        end = min(start + chunk_size, len(normalized))
+        if end < len(normalized):
+            paragraph_break = normalized.rfind("\n\n", start, end)
+            if paragraph_break > start:
+                end = paragraph_break
+
+        chunk = normalized[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= len(normalized):
+            break
+        start = max(start + 1, end - overlap)
 
     return chunks
 

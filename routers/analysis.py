@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pypdf import PdfReader
 from schemas.models import ChatRequest, ImpactReportResponse
+from services.document_extraction import extract_document_text
 from services.agent_flow import run_agent_workflow
 from services.chunking import build_chunks_from_documents
 from services.embeddings import embed_chunks
@@ -75,7 +76,7 @@ async def analyze_change_request(
     analyst_prompt: str = Form(...,
                                description="Descripción del cambio propuesto"),
     file: UploadFile = File(
-        None, description="PDF opcional con detalles adicionales de la solicitud de cambio")
+        None, description="Documento PDF, DOC, DOCX, TXT o MD con detalles adicionales")
 ):
     """
     Endpoint para procesar solicitudes de cambio combinando la base de datos inicial 
@@ -90,17 +91,16 @@ async def analyze_change_request(
         if file:
             file_bytes = await file.read()
             extension = Path(file.filename).suffix.lower()
-            if extension == ".pdf":
-                import io
-                reader = PdfReader(io.BytesIO(file_bytes))
-                uploaded_text = "".join(
-                    page.extract_text() or "" for page in reader.pages)
-            elif extension in {".txt", ".md"}:
-                uploaded_text = file_bytes.decode("utf-8-sig")
-            else:
+            if extension not in {".pdf", ".doc", ".docx", ".txt", ".md"}:
                 raise HTTPException(
                     status_code=415,
-                    detail="Formato no admitido. Use PDF, TXT o MD.")
+                    detail="Formato no admitido. Use PDF, DOC, DOCX, TXT o MD.")
+            try:
+                uploaded_text = extract_document_text(file_bytes, extension)
+            except Exception as extraction_error:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"No se pudo extraer texto del documento: {str(extraction_error)}")
 
             if not uploaded_text.strip():
                 raise HTTPException(
@@ -150,9 +150,58 @@ async def chat(payload: ChatRequest):
             status_code=500, detail=f"Error interno ejecutando el agente: {str(e)}")
 
 
+def format_readable_report(report: ImpactReportResponse) -> tuple[str, list[dict]]:
+    lines = [report.summary_report.strip()]
+
+    if report.technical_changes:
+        lines.extend(["", "Cambios técnicos"])
+        for index, change in enumerate(report.technical_changes, start=1):
+            system = f" ({change.affected_system})" if change.affected_system else ""
+            lines.append(f"{index}. {change.description}{system}")
+
+    if report.affected_stakeholders:
+        lines.extend(["", "Impacto en stakeholders"])
+        for stakeholder in report.affected_stakeholders:
+            lines.append(
+                f"- {stakeholder.stakeholder}: {stakeholder.impact} "
+                f"(nivel {stakeholder.severity.value.lower()})"
+            )
+
+    if report.required_mitigations:
+        lines.extend(["", "Mitigaciones requeridas"])
+        lines.extend(
+            f"- {mitigation}" for mitigation in report.required_mitigations
+        )
+
+    lines.extend(["", f"Nivel de riesgo: {report.risk_level.value}"])
+
+    citations = []
+    seen_documents = set()
+    for source in report.sources:
+        key = (source.document_id, source.chunk_id)
+        if key in seen_documents:
+            continue
+        seen_documents.add(key)
+        citations.append({
+            "document": source.document_id,
+            "title": source.title,
+            "fragment": source.chunk_id,
+        })
+
+    if citations:
+        lines.extend(["", "Documentos citados"])
+        lines.extend(
+            f"- {citation['document']}"
+            + (f" ({citation['fragment']})" if citation['fragment'] else "")
+            for citation in citations
+        )
+
+    return "\n".join(lines), citations
+
+
 @router.post("/chat/stream")
 async def chat_stream(payload: ChatRequest):
-    """Transmite etapas del agente y el reporte final como JSON Lines."""
+    """Transmite progreso y un reporte narrativo más legible como JSON Lines."""
     async def event_stream():
         import json
 
@@ -172,8 +221,15 @@ async def chat_stream(payload: ChatRequest):
         )
         report["request_id"] = create_request_id()
         validated = ImpactReportResponse.model_validate(report)
+        narrative, citations = format_readable_report(validated)
         yield json.dumps(
-            {"type": "complete", "report": validated.model_dump(mode="json")},
+            {
+                "type": "complete",
+                "request_id": validated.request_id,
+                "narrative": narrative,
+                "citations": citations,
+                "report": validated.model_dump(mode="json"),
+            },
             ensure_ascii=False) + "\n"
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")

@@ -153,7 +153,6 @@ async def chat_stream(
         else:
             yield "event: progress\ndata: Preparando una respuesta\n\n"
 
-        session_id = resolve_session_id(chat_session_id)
         state = get_or_create_session(session_id)
         standalone_query, _, session_context = prepare_context_message(
             state, payload.message)

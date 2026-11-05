@@ -3,6 +3,7 @@
 import os
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -12,12 +13,28 @@ EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
 GENERATION_MODEL = os.environ.get(
     'GENERATION_MODEL', 'llama-3.3-70b-versatile')
 
-# Inicializamos el codificador local para reemplazar la llamada de OpenAI en embeddings
-encoder = SentenceTransformer(EMBEDDING_MODEL)
+EMBEDDING_PROVIDER = os.environ.get(
+    "EMBEDDING_PROVIDER", "local").strip().lower()
+OPENAI_EMBEDDING_MODEL = os.environ.get(
+    "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+encoder = None
+openai_embeddings_client = None
+if EMBEDDING_PROVIDER == "local":
+    encoder = SentenceTransformer(EMBEDDING_MODEL)
+else:
+    openai_embeddings_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 def get_embedding(text: str) -> list[float]:
-    """Genera el vector embedding localmente de manera gratuita."""
+    """Genera un embedding mediante el proveedor configurado."""
+    if EMBEDDING_PROVIDER == "openai":
+        response = openai_embeddings_client.embeddings.create(
+            model=OPENAI_EMBEDDING_MODEL,
+            input=text,
+        )
+        return response.data[0].embedding
+
     embedding = encoder.encode(text)
     return embedding.tolist()
 

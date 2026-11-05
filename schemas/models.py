@@ -1,5 +1,7 @@
 # schemas/models.py
 
+from __future__ import annotations
+
 from enum import Enum
 from typing import List, Optional
 
@@ -41,8 +43,51 @@ class ChangeRequestPayload(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1)
     target_system: Optional[str] = None
+
+
+class ConversationMessage(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str
+
+
+class CompactReport(BaseModel):
+    executive_summary: str
+    risk_level: Optional[RiskLevel] = None
+    key_mitigations: List[str] = Field(default_factory=list)
+
+
+class SessionState(BaseModel):
+    session_id: str
+    change_request_id: Optional[str] = None
+    systems: List[str] = Field(default_factory=list)
+    stakeholders: List[str] = Field(default_factory=list)
+    risk_level: Optional[RiskLevel] = None
+    summary: str = ""
+    messages: List[ConversationMessage] = Field(default_factory=list)
+    last_report: Optional[ImpactReportResponse] = None
+
+
+class ChatResponse(BaseModel):
+    session_id: str
+    answer: str
+    sources: List[SourceReference] = Field(default_factory=list)
+    insufficient_information: bool = False
+
+
+class LLMImpactReport(BaseModel):
+    """Campos producidos por el LLM antes de agregar ID y fuentes."""
+    technical_changes: List[TechnicalChange] = Field(default_factory=list)
+    risk_level: RiskLevel = RiskLevel.MEDIUM
+    affected_stakeholders: List[StakeholderImpact] = Field(
+        default_factory=list)
+    required_mitigations: List[str] = Field(default_factory=list)
+    dependencies: List[str] = Field(default_factory=list)
+    summary_report: str
+    confidence: str = Field(
+        description="Nivel de confianza: Bajo, Medio o Alto")
+    insufficient_information: bool = False
 
 
 class ImpactReportResponse(BaseModel):

@@ -1,7 +1,7 @@
 # main.py
 
 from fastapi import FastAPI
-from routers import analysis
+from routers import analysis, chat
 
 app = FastAPI(
     title="Agentic Airlines - Impact Analyzer API",
@@ -9,8 +9,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Incluir el router de análisis
+# Registrar los routers separados de análisis y conversación
 app.include_router(analysis.router)
+app.include_router(chat.router)
 
 
 @app.get("/")

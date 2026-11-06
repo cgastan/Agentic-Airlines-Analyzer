@@ -26,9 +26,9 @@ class Settings(BaseSettings):
     # "auto" aplica "low" sólo a modelos de razonamiento (gpt-oss, o-series).
     LLM_REASONING_EFFORT: str = "auto"
 
-    # Embeddings (local | openai)
-    EMBEDDING_PROVIDER: str = "local"
-    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+    # Embeddings: "openai" (por defecto, según la consigna) o "local" (Sentence Transformers).
+    EMBEDDING_PROVIDER: str = "openai"
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"  # sólo se usa con EMBEDDING_PROVIDER=local
     OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
 
     # Chunking y recuperación

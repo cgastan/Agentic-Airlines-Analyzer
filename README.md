@@ -13,7 +13,7 @@ routers/
 services/
   readers.py           extracción de texto PDF/DOCX/DOC/TXT/MD con página y sección
   chunking.py          fragmentación con solapamiento, conservando archivo/página/sección
-  embeddings.py        embeddings densos: Sentence Transformers local u OpenAI
+  embeddings.py        embeddings densos: OpenAI (por defecto) o Sentence Transformers local
   ingestion_service.py extracción -> chunks -> embeddings (con caché); igual para todo documento
   vector_store.py      índice híbrido: similitud coseno + BM25 combinados con RRF
   rag.py               funciones de recuperación del agente
@@ -58,9 +58,10 @@ pip install -r requirements.txt
 LLM_PROVIDER=groq                 # o openai
 GROQ_API_KEY=tu_clave
 GENERATION_MODEL=openai/gpt-oss-20b
-EMBEDDING_PROVIDER=local          # o openai (usa OPENAI_EMBEDDING_MODEL)
-EMBEDDING_MODEL=all-MiniLM-L6-v2
-# OPENAI_API_KEY=...
+OPENAI_API_KEY=tu_clave           # requerida: embeddings de OpenAI (text-embedding-3-small)
+# OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+# EMBEDDING_PROVIDER=local        # alternativa sin OpenAI (Sentence Transformers)
+# EMBEDDING_MODEL=all-MiniLM-L6-v2
 ```
 
 ## Ejecución

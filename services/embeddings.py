@@ -16,9 +16,19 @@ def _local_encoder():
     return SentenceTransformer(settings.EMBEDDING_MODEL)
 
 
+def check_embedding_config() -> None:
+    """Falla de inmediato (y con un mensaje claro) si falta la clave de OpenAI."""
+    if settings.EMBEDDING_PROVIDER.lower() == "openai" and not settings.OPENAI_API_KEY:
+        raise RuntimeError(
+            "EMBEDDING_PROVIDER=openai requiere OPENAI_API_KEY en el archivo .env "
+            "(o use EMBEDDING_PROVIDER=local para embeddings locales)."
+        )
+
+
 @lru_cache(maxsize=1)
 def _openai_client():
     from openai import AsyncOpenAI
+    check_embedding_config()
     return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
 

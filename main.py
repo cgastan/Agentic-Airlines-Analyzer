@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from config import settings
 from routers import analysis, chat
+from services.embeddings import check_embedding_config
 from services.ingestion_service import build_index
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # El índice se construye una vez al arrancar (con caché de embeddings y clasificación).
+    check_embedding_config()
     app.state.index_lock = asyncio.Lock()
     app.state.index = await build_index()
     if app.state.index is None:

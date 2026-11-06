@@ -244,3 +244,20 @@ def test_target_system_is_not_duplicated_when_case_differs(fake_llm):
     # El LLM falso extrae 'Reservas'; 'RESERVAS' no debe agregarse como sistema distinto.
     assert captured["query"].casefold().count("reservas") >= 1
     assert ImpactReportResponse.model_validate(report)
+
+
+# ---------- Embeddings OpenAI ----------
+
+def test_openai_is_the_default_embedding_provider():
+    from config import Settings
+    assert Settings(_env_file=None).EMBEDDING_PROVIDER == "openai"
+
+
+def test_missing_openai_key_fails_fast_with_clear_message(monkeypatch):
+    from services.embeddings import check_embedding_config
+    monkeypatch.setattr(settings, "EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", None)
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        check_embedding_config()
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", "sk-test")
+    check_embedding_config()

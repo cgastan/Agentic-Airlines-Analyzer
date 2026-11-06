@@ -37,7 +37,8 @@ def validate_payload(analyst_prompt: str, target_system: str | None) -> ChangeRe
     try:
         return ChangeRequestPayload(analyst_prompt=analyst_prompt, target_system=target_system or None)
     except ValidationError as error:
-        raise HTTPException(status_code=422, detail=error.errors(include_url=False, include_context=False))
+        raise HTTPException(status_code=422, detail=error.errors(
+            include_url=False, include_context=False))
 
 
 async def read_upload(file: UploadFile | None) -> tuple[str, bytes] | None:
@@ -46,10 +47,12 @@ async def read_upload(file: UploadFile | None) -> tuple[str, bytes] | None:
         return None
     filename = Path(file.filename).name  # Evita rutas tipo ../../archivo
     if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(415, f"Formato no admitido. Use: {', '.join(sorted(SUPPORTED_EXTENSIONS))}.")
+        raise HTTPException(
+            415, f"Formato no admitido. Use: {', '.join(sorted(SUPPORTED_EXTENSIONS))}.")
     data = await file.read()
     if len(data) > settings.MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, f"El archivo supera {settings.MAX_UPLOAD_MB} MB.")
+        raise HTTPException(
+            413, f"El archivo supera {settings.MAX_UPLOAD_MB} MB.")
     if not data.strip():
         raise HTTPException(422, "El documento está vacío.")
     return filename, data
@@ -60,10 +63,12 @@ async def extract_upload_text(upload: tuple[str, bytes]) -> str:
     try:
         pages = await asyncio.to_thread(read_document, filename, data)
     except Exception as error:
-        raise HTTPException(422, f"No se pudo extraer texto de {filename}: {error}")
+        raise HTTPException(
+            422, f"No se pudo extraer texto de {filename}: {error}")
     text = "\n".join(page.text for page in pages).strip()
     if not text:
-        raise HTTPException(422, f"{filename} no contiene texto extraíble (¿PDF escaneado?).")
+        raise HTTPException(
+            422, f"{filename} no contiene texto extraíble (¿PDF escaneado?).")
     return text
 
 
@@ -79,7 +84,8 @@ async def build_request_index(request: Request, upload):
 @router.post("/analyze", response_model=ImpactReportResponse)
 async def analyze_change_request(
     request: Request,
-    analyst_prompt: str = Form(..., description="Descripción del cambio propuesto"),
+    analyst_prompt: str = Form(...,
+                               description="Descripción del cambio propuesto"),
     target_system: str | None = Form(None, description=TARGET_SYSTEM_DESCRIPTION,
                                      examples=TARGET_SYSTEM_EXAMPLES),
     file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
@@ -100,13 +106,15 @@ async def analyze_change_request(
         return ImpactReportResponse.model_validate(report)
     except Exception as error:
         logger.exception("Error en /analyze")
-        raise HTTPException(500, f"Error interno ejecutando el agente: {error}")
+        raise HTTPException(
+            500, f"Error interno ejecutando el agente: {error}")
 
 
 @router.post("/analyze/stream")
 async def analyze_change_request_stream(
     request: Request,
-    analyst_prompt: str = Form(..., description="Descripción del cambio propuesto"),
+    analyst_prompt: str = Form(...,
+                               description="Descripción del cambio propuesto"),
     target_system: str | None = Form(None, description=TARGET_SYSTEM_DESCRIPTION,
                                      examples=TARGET_SYSTEM_EXAMPLES),
     file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
@@ -130,7 +138,8 @@ async def analyze_change_request_stream(
                 if event["event"] == "progress":
                     yield sse("progress", {"step": event["step"], "message": event["message"]})
                 else:
-                    report = ImpactReportResponse.model_validate(event["report"])
+                    report = ImpactReportResponse.model_validate(
+                        event["report"])
                     yield sse("final", report.model_dump(mode="json"))
         except Exception as error:
             logger.exception("Error en /analyze/stream")
@@ -150,7 +159,8 @@ async def list_documents(request: Request):
     if index is None:
         return DocumentsResponse(documents=[], total_chunks=0)
     return DocumentsResponse(
-        documents=[IngestedDocument(filename=name, chunks=count) for name, count in index.sources.items()],
+        documents=[IngestedDocument(filename=name, chunks=count)
+                   for name, count in index.sources.items()],
         total_chunks=len(index),
     )
 
@@ -165,7 +175,8 @@ async def upload_documents(
     if not uploads:
         raise HTTPException(422, "No se recibió ningún archivo.")
     for upload in uploads:
-        await extract_upload_text(upload)  # 422 temprano si alguno no tiene texto
+        # 422 temprano si alguno no tiene texto
+        await extract_upload_text(upload)
 
     async with request.app.state.index_lock:
         index, chunks = await extend_index(request.app.state.index, uploads)

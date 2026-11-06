@@ -5,7 +5,7 @@ import unicodedata
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class RiskLevel(str, Enum):
@@ -72,6 +72,13 @@ class ConversationMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    # Ejemplo que Swagger carga por defecto: session_id en null => el servidor crea uno nuevo.
+    model_config = ConfigDict(json_schema_extra={"examples": [{
+        "message": "¿Qué impacto tiene migrar el motor de reservas?",
+        "session_id": None,
+        "target_system": None,
+    }]})
+
     message: str = Field(..., min_length=1, max_length=8000)
     session_id: Optional[str] = Field(
         None, max_length=64,
@@ -143,7 +150,8 @@ class LLMImpactReport(BaseModel):
     technical_changes: List[TechnicalChange] = Field(default_factory=list)
     risk_level: RiskLevel = RiskLevel.MEDIUM
     risk_justification: str = ""
-    affected_stakeholders: List[StakeholderImpact] = Field(default_factory=list)
+    affected_stakeholders: List[StakeholderImpact] = Field(
+        default_factory=list)
     required_mitigations: List[str] = Field(default_factory=list)
     dependencies: List[str] = Field(default_factory=list)
     open_questions: List[str] = Field(default_factory=list)
@@ -172,7 +180,8 @@ class ImpactReportResponse(LLMImpactReport):
 
 class ChatResponse(BaseModel):
     answer: str
-    session_id: str = ""              # reenviar en el siguiente mensaje para mantener el contexto
+    # reenviar en el siguiente mensaje para mantener el contexto
+    session_id: str = ""
     intent: str = "impact_analysis"   # impact_analysis | casual_chat | off_topic
     report: Optional[ImpactReportResponse] = None
     sources: List[SourceReference] = Field(default_factory=list)

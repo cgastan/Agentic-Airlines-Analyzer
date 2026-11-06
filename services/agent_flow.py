@@ -20,6 +20,7 @@ from pydantic import ValidationError
 
 from config import settings
 from schemas.models import (
+    system_key,
     AgentTrace,
     ChangeDetails,
     ConfidenceLevel,
@@ -106,8 +107,11 @@ Devuelve JSON con:
             stakeholder_query=state.analyst_prompt,
         )
 
-    if state.target_system and state.target_system not in details.affected_systems:
-        details.affected_systems.insert(0, state.target_system)
+    if state.target_system:
+        # Sin distinguir mayúsculas/acentos: 'payhub' no se agrega si el LLM ya extrajo 'PayHub'.
+        known = {system_key(system) for system in details.affected_systems}
+        if system_key(state.target_system) not in known:
+            details.affected_systems.insert(0, state.target_system)
     state.details = details
     state.spec_query = details.spec_query or state.analyst_prompt
     state.stakeholder_query = details.stakeholder_query or state.analyst_prompt
@@ -328,6 +332,10 @@ async def run_agent_workflow_events(
     conversation_context: str = "",
 ) -> AsyncIterator[dict]:
     """Ejecuta el pipeline y emite un evento por paso; el último trae el reporte."""
+    # Usa la grafía del corpus ('payhub' -> 'PayHub'); si no aparece, conserva lo escrito.
+    if target_system and index is not None:
+        target_system = index.canonical_spelling(target_system) or target_system
+
     state = AgentState(
         analyst_prompt=analyst_prompt,
         target_system=target_system,

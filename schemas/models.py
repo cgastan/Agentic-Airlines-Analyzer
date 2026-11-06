@@ -1,6 +1,7 @@
 """Contratos Pydantic de entrada, estado intermedio del agente y reporte final."""
 from __future__ import annotations
 
+import unicodedata
 from enum import Enum
 from typing import List, Optional
 
@@ -22,12 +23,34 @@ class ConfidenceLevel(str, Enum):
 
 # ---------- Entrada ----------
 
+TARGET_SYSTEM_DESCRIPTION = (
+    "Sistema o componente principal que se quiere modificar (opcional). "
+    "Ayuda al agente a buscar en la documentación del sistema correcto cuando el mensaje es vago. "
+    "Use el nombre tal como aparece en sus documentos; no distingue mayúsculas, minúsculas ni espacios extra. "
+    "Ejemplos: 'AirBook', 'PayHub', 'motor de reservas', 'SkyBus'."
+)
+TARGET_SYSTEM_EXAMPLES = ["AirBook", "PayHub", "motor de reservas"]
+
+
+def system_key(value: str) -> str:
+    """Forma comparable de un nombre de sistema: minúsculas, sin acentos y sin espacios repetidos."""
+    decomposed = unicodedata.normalize("NFKD", value)
+    plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(plain.casefold().split())
+
+
+def clean_system_name(value: Optional[str]) -> Optional[str]:
+    """Recorta y colapsa espacios; un valor vacío equivale a no indicar sistema."""
+    cleaned = " ".join((value or "").split())
+    return cleaned or None
+
+
 class ChangeRequestPayload(BaseModel):
     """Valida la solicitud de cambio enviada por el Business Analyst."""
     analyst_prompt: str = Field(..., min_length=5, max_length=8000,
                                 description="Descripción del cambio propuesto.")
     target_system: Optional[str] = Field(
-        None, max_length=200, description="Sistema o componente principal afectado.")
+        None, max_length=200, description=TARGET_SYSTEM_DESCRIPTION, examples=TARGET_SYSTEM_EXAMPLES)
 
     @field_validator("analyst_prompt")
     @classmethod
@@ -37,10 +60,21 @@ class ChangeRequestPayload(BaseModel):
             raise ValueError("La descripción del cambio es demasiado corta.")
         return value
 
+    @field_validator("target_system")
+    @classmethod
+    def normalize_target_system(cls, value: Optional[str]) -> Optional[str]:
+        return clean_system_name(value)
+
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
-    target_system: Optional[str] = Field(None, max_length=200)
+    target_system: Optional[str] = Field(
+        None, max_length=200, description=TARGET_SYSTEM_DESCRIPTION, examples=TARGET_SYSTEM_EXAMPLES)
+
+    @field_validator("target_system")
+    @classmethod
+    def normalize_target_system(cls, value: Optional[str]) -> Optional[str]:
+        return clean_system_name(value)
 
 
 # ---------- Estado intermedio del agente ----------

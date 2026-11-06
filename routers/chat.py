@@ -33,7 +33,8 @@ def sse(event: str, data) -> str:
 
 def format_readable_report(report: ImpactReportResponse) -> str:
     """Versión en texto del reporte para mostrar en un chat."""
-    lines = [report.summary_report.strip(), "", f"Nivel de riesgo: {report.risk_level.value}"]
+    lines = [report.summary_report.strip(
+    ), "", f"Nivel de riesgo: {report.risk_level.value}"]
     if report.risk_justification:
         lines.append(report.risk_justification)
     if report.technical_changes:
@@ -45,9 +46,11 @@ def format_readable_report(report: ImpactReportResponse) -> str:
         lines += [f"- {s.stakeholder}: {s.impact} (severidad {s.severity.value})"
                   for s in report.affected_stakeholders]
     if report.required_mitigations:
-        lines += ["", "Mitigaciones requeridas:"] + [f"- {m}" for m in report.required_mitigations]
+        lines += ["", "Mitigaciones requeridas:"] + \
+            [f"- {m}" for m in report.required_mitigations]
     if report.open_questions:
-        lines += ["", "Preguntas abiertas:"] + [f"- {q}" for q in report.open_questions]
+        lines += ["", "Preguntas abiertas:"] + \
+            [f"- {q}" for q in report.open_questions]
     if report.sources:
         documents = dict.fromkeys(s.document_id for s in report.sources)
         lines += ["", "Fuentes: " + ", ".join(documents)]
@@ -105,7 +108,8 @@ async def chat(
                 return event["response"]
     except Exception as error:
         logger.exception("Error en /chat")
-        raise HTTPException(500, f"Error interno ejecutando el agente: {error}")
+        raise HTTPException(
+            500, f"Error interno ejecutando el agente: {error}")
     raise HTTPException(500, "El agente no devolvió respuesta.")
 
 

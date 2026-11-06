@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from collections.abc import Iterable
 
 import numpy as np
 from rank_bm25 import BM25Okapi
 
 from config import settings
+from schemas.models import system_key
 from services.chunking import Chunk, extract_identifiers
 
 
@@ -54,6 +56,33 @@ class HybridIndex:
     def sources(self) -> dict[str, str]:
         """Documento -> tipo documental, para inspección vía API."""
         return {chunk.source: chunk.doc_type for chunk in self.chunks}
+
+    def canonical_spelling(self, term: str) -> str | None:
+        """Cómo escriben los documentos un término (p.ej. 'payhub' -> 'PayHub').
+
+        Compara sin distinguir mayúsculas ni acentos y devuelve la grafía más
+        frecuente encontrada en el corpus, o None si el término no aparece.
+        """
+        key = system_key(term)
+        if not key:
+            return None
+        pattern = re.compile(r"\b" + r"\s+".join(map(re.escape, key.split())) + r"\b")
+        spellings: Counter[str] = Counter()
+        for chunk in self.chunks:
+            text = unicodedata.normalize("NFC", chunk.text)
+            # Texto "plano" (sin acentos, en minúsculas) y, para cada carácter plano,
+            # su posición en el texto original: así se recupera la grafía real con acentos.
+            plain_chars: list[str] = []
+            positions: list[int] = []
+            for position, char in enumerate(text):
+                for base in unicodedata.normalize("NFD", char):
+                    if not unicodedata.combining(base):
+                        plain_chars.append(base.casefold())
+                        positions.append(position)
+            for match in pattern.finditer("".join(plain_chars)):
+                start, end = positions[match.start()], positions[match.end() - 1] + 1
+                spellings[" ".join(text[start:end].split())] += 1
+        return spellings.most_common(1)[0][0] if spellings else None
 
     def merged_with(self, chunks: list[Chunk], embeddings: list[list[float]]) -> "HybridIndex":
         """Devuelve un índice nuevo con fragmentos adicionales, sin mutar el actual.

@@ -12,6 +12,8 @@ from pydantic import ValidationError
 
 from config import settings
 from schemas.models import (
+    TARGET_SYSTEM_DESCRIPTION,
+    TARGET_SYSTEM_EXAMPLES,
     ChangeRequestPayload,
     DocumentsResponse,
     ImpactReportResponse,
@@ -85,7 +87,8 @@ async def build_request_index(request: Request, upload, doc_type: str | None):
 async def analyze_change_request(
     request: Request,
     analyst_prompt: str = Form(..., description="Descripción del cambio propuesto"),
-    target_system: str | None = Form(None, description="Sistema principal afectado (opcional)"),
+    target_system: str | None = Form(None, description=TARGET_SYSTEM_DESCRIPTION,
+                                     examples=TARGET_SYSTEM_EXAMPLES),
     document_type: str | None = Form(None, description=DOC_TYPE_DESCRIPTION),
     file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
 ):
@@ -113,7 +116,8 @@ async def analyze_change_request(
 async def analyze_change_request_stream(
     request: Request,
     analyst_prompt: str = Form(..., description="Descripción del cambio propuesto"),
-    target_system: str | None = Form(None, description="Sistema principal afectado (opcional)"),
+    target_system: str | None = Form(None, description=TARGET_SYSTEM_DESCRIPTION,
+                                     examples=TARGET_SYSTEM_EXAMPLES),
     document_type: str | None = Form(None, description=DOC_TYPE_DESCRIPTION),
     file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
 ):

@@ -226,3 +226,41 @@ def test_workflow_without_documents_does_not_invent(fake_llm):
 def test_invalid_report_is_rejected():
     with pytest.raises(ValidationError):
         ImpactReportResponse(request_id="X", risk_level="Desconocido", summary_report="x")
+
+
+# ---------- target_system ----------
+
+def test_system_name_is_cleaned_and_compared_case_insensitively():
+    from schemas.models import ChatRequest, system_key
+
+    assert ChatRequest(message="x", target_system="  Motor   de  Reservas ").target_system == "Motor de Reservas"
+    assert ChatRequest(message="x", target_system="   ").target_system is None
+    assert system_key("PAYHUB") == system_key("payhub") == system_key("  PayHub ")
+    assert system_key("Reservación") == system_key("RESERVACION")
+
+
+def test_canonical_spelling_uses_corpus_form():
+    index, _ = _index()
+    assert index.canonical_spelling("MOTOR DE   RESERVAS") == "motor de reservas"
+    assert index.canonical_spelling("POLITICA") == "Política"      # recupera el acento del documento
+    assert index.canonical_spelling("sistema inexistente") is None
+
+
+def test_target_system_is_not_duplicated_when_case_differs(fake_llm):
+    index = _workflow_index(fake_llm)
+    captured = {}
+    original = agent_flow.rag.search_specifications
+
+    async def spy(idx, query):
+        captured["query"] = query
+        return await original(idx, query)
+
+    agent_flow.rag.search_specifications = spy
+    try:
+        report = run(agent_flow.run_agent_workflow(
+            "Migrar", index, target_system="RESERVAS"))
+    finally:
+        agent_flow.rag.search_specifications = original
+    # El LLM falso extrae 'Reservas'; 'RESERVAS' no debe agregarse como sistema distinto.
+    assert captured["query"].casefold().count("reservas") >= 1
+    assert ImpactReportResponse.model_validate(report)

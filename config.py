@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 120
     SPEC_TOP_K: int = 5
     STAKEHOLDER_TOP_K: int = 4
+    POLICY_TOP_K: int = 3         # fragmentos extra con criterios de riesgo y aprobaciones
     POOL_SIZE: int = 20
     RRF_K: int = 60
 

@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 COMPANY = "Agentic Airlines SRL"
 UPLOAD_CHAR_BUDGET = 12000
+# Consulta genérica (sin datos de la empresa): ubica la sección de la política de cambios que
+# define niveles de riesgo y aprobaciones, para que el reporte clasifique con esos criterios.
+RISK_POLICY_QUERY = "niveles de riesgo criterios aprobación requerida rollback máximo política de cambios"
 
 
 def create_request_id() -> str:
@@ -96,8 +99,10 @@ Devuelve JSON con:
   "identifiers": ["códigos, normas o IDs mencionados textualmente"],
   "scope_limits": ["límites de alcance explícitos; vacío si no se indican"],
   "spec_query": "consulta para buscar componentes, dependencias e integraciones técnicas",
-  "stakeholder_query": "consulta para buscar impactos operativos, políticas y feedback de stakeholders"
-}}"""
+  "stakeholder_query": "consulta para buscar posturas de stakeholders, impactos operativos y políticas (criterios de riesgo y aprobaciones requeridas)"
+}}
+Las consultas son frases en lenguaje natural con palabras clave (nombres de sistemas, códigos,
+procesos). No escribas SQL ni código: se usan en un buscador semántico y por palabras."""
     try:
         data = await llm.complete_json(prompt, temperature=0, max_tokens=1200)
         # aca se valida que el JSON cumpla con el modelo ChangeDetails
@@ -147,11 +152,17 @@ async def retrieve_stakeholder_notes_rag(state: AgentState, index: HybridIndex |
     """Busca impactos operativos y organizacionales en notas de stakeholders y políticas."""
     terms = (state.details.stakeholder_perspectives +
              state.details.identifiers) if state.details else []
+    seen = {chunk["id"] for chunk in state.tech_chunks}
     state.stakeholder_chunks = await rag.search_stakeholder_notes(
         index,
         _with_entities(state.stakeholder_query, terms),
-        exclude_ids={chunk["id"] for chunk in state.tech_chunks},
+        exclude_ids=seen,
     )
+    # Todo análisis de impacto debe clasificar el riesgo según la política vigente: se suman
+    # siempre los fragmentos que definen niveles de riesgo y aprobaciones (si existen en la base).
+    seen |= {chunk["id"] for chunk in state.stakeholder_chunks}
+    state.stakeholder_chunks += await rag.search(
+        index, RISK_POLICY_QUERY, settings.POLICY_TOP_K, exclude_ids=seen)
     return state
 
 
@@ -221,7 +232,7 @@ Información faltante según el evaluador: {missing}
 
 Reformula ambas consultas para cubrir lo faltante: usa sinónimos, nombres de sistemas
 o procesos probables, términos de integración/dependencia y de impacto operativo.
-No repitas consultas ya probadas.
+No repitas consultas ya probadas. Escribe frases en lenguaje natural con palabras clave, no SQL.
 Devuelve JSON: {{"spec_query": "...", "stakeholder_query": "..."}}"""
     try:
         queries = RewrittenQueries.model_validate(
@@ -283,9 +294,13 @@ Detalles extraídos del cambio: {details}
 
 {"ADVERTENCIA: el contexto fue evaluado como incompleto. Faltante: " + str(state.grade.missing_information) if insufficient else ""}
 
-Criterios de riesgo: Bajo (cambio aislado, sin clientes ni cumplimiento afectados),
-Medio (varios componentes o un área operativa), Alto (sistemas críticos, clientes o
-cumplimiento normativo), Critico (seguridad operacional, pagos o regulación con riesgo de incumplimiento).
+Criterios de riesgo: si el contexto incluye una política de la empresa con criterios de riesgo,
+aplica ESOS criterios: prevalecen sobre los genéricos y sobre la evaluación propia del solicitante.
+Si el cambio cumple criterios de dos niveles, usa el más alto.
+Criterios genéricos (solo si no hay política): Bajo (cambio aislado, sin clientes ni cumplimiento
+afectados), Medio (varios componentes o un área operativa), Alto (sistemas críticos, cobros o
+reembolsos, datos personales o clientes), Critico (seguridad operacional o regulación con riesgo
+de incumplimiento).
 
 Devuelve JSON con esta estructura:
 {{

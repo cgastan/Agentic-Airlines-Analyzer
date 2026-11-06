@@ -1,140 +1,197 @@
+"""Endpoints de análisis de impacto y gestión de la base documental."""
+from __future__ import annotations
+
+import asyncio
 import json
-import uuid
-import inspect
-from contextvars import ContextVar
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
-from schemas.models import ImpactReportResponse
-from services.agent_flow import run_agent_workflow
-from services.chunking import build_chunks_from_documents
-from services.document_extraction import extract_document_text
-from services.ingestion_service import add_documents
+from config import settings
+from schemas.models import (
+    ChangeRequestPayload,
+    DocumentsResponse,
+    ImpactReportResponse,
+    IngestedDocument,
+)
+from services.agent_flow import run_agent_workflow_events
+from services.ingestion_service import DOC_TYPES, extend_index
+from services.readers import SUPPORTED_EXTENSIONS, read_document
 
-# Prefijo común y etiqueta usados por FastAPI para agrupar los endpoints.
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["Impact Analysis"])
-current_index: ContextVar = ContextVar("current_index", default=None)
+
+FILE_DESCRIPTION = f"Documento ({', '.join(sorted(SUPPORTED_EXTENSIONS))}) con la solicitud de cambio u otra evidencia"
+DOC_TYPE_DESCRIPTION = f"Opcional: {', '.join(sorted(DOC_TYPES))}. Si se omite, se infiere del contenido."
 
 
-def create_request_id() -> str:
-    """Genera un identificador corto único para cada solicitud."""
-    return f"CHG-{uuid.uuid4().hex[:12].upper()}"
+def sse(event: str, data) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def process_analysis(
-    analyst_prompt: str,
-    file: UploadFile | None,
-) -> ImpactReportResponse:
-    """Procesa el cambio solicitado y devuelve un informe de impacto validado."""
-    # Se trabaja sobre copias para no modificar los almacenes cargados globalmente.
-    if file:
-        file_bytes = await file.read()
-        extension = Path(file.filename).suffix.lower()
-        # Rechaza formatos que el extractor de documentos no admite.
-        if extension not in {".pdf", ".doc", ".docx", ".txt", ".md"}:
-            raise HTTPException(
-                status_code=415,
-                detail="Formato no admitido. Use PDF, DOC, DOCX, TXT o MD.",
-            )
-
-        try:
-            uploaded_text = extract_document_text(file_bytes, extension)
-        except Exception as extraction_error:
-            raise HTTPException(
-                status_code=422,
-                detail=f"No se pudo extraer texto del documento: {str(extraction_error)}",
-            )
-
-        # Un documento sin texto no aporta contexto útil al flujo de agentes.
-        if not uploaded_text.strip():
-            raise HTTPException(
-                status_code=422,
-                detail="El documento está vacío o no contiene texto.",
-            )
-
-        uploaded = Path(file.filename or "upload.txt")
-        uploaded_index = await add_documents([(uploaded, file_bytes)])
-        # Mantiene una sesión de consulta independiente de las cargas persistentes.
-        # Las cargas usan temporalmente el índice recién construido para esta solicitud.
-        index = uploaded_index
-
-    # Ejecuta el flujo de agentes con el contexto técnico y operativo disponible.
-    index = current_index.get()
-    result = run_agent_workflow(
-        analyst_prompt=analyst_prompt,
-        index=index,
-        allow_casual=False,
-    )
-    report = await result if inspect.isawaitable(result) else result
-    report["request_id"] = create_request_id()
-    return ImpactReportResponse.model_validate(report)
+def validate_payload(analyst_prompt: str, target_system: str | None) -> ChangeRequestPayload:
+    try:
+        return ChangeRequestPayload(analyst_prompt=analyst_prompt, target_system=target_system or None)
+    except ValidationError as error:
+        raise HTTPException(status_code=422, detail=error.errors(include_url=False, include_context=False))
 
 
-# Endpoint que espera el resultado completo antes de devolver la respuesta JSON.
+def validate_doc_type(doc_type: str | None) -> str | None:
+    if doc_type and doc_type not in DOC_TYPES:
+        raise HTTPException(422, f"document_type inválido. Valores: {', '.join(sorted(DOC_TYPES))}")
+    return doc_type or None
+
+
+async def read_upload(file: UploadFile | None) -> tuple[str, bytes] | None:
+    """Lee el archivo (antes de abrir el stream) y valida formato, tamaño y contenido."""
+    if file is None or not file.filename:
+        return None
+    filename = Path(file.filename).name  # Evita rutas tipo ../../archivo
+    if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(415, f"Formato no admitido. Use: {', '.join(sorted(SUPPORTED_EXTENSIONS))}.")
+    data = await file.read()
+    if len(data) > settings.MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, f"El archivo supera {settings.MAX_UPLOAD_MB} MB.")
+    if not data.strip():
+        raise HTTPException(422, "El documento está vacío.")
+    return filename, data
+
+
+async def extract_upload_text(upload: tuple[str, bytes]) -> str:
+    filename, data = upload
+    try:
+        pages = await asyncio.to_thread(read_document, filename, data)
+    except Exception as error:
+        raise HTTPException(422, f"No se pudo extraer texto de {filename}: {error}")
+    text = "\n".join(page.text for page in pages).strip()
+    if not text:
+        raise HTTPException(422, f"{filename} no contiene texto extraíble (¿PDF escaneado?).")
+    return text
+
+
+async def build_request_index(request: Request, upload, doc_type: str | None):
+    """Índice para esta solicitud: base + archivo subido. El índice global no se modifica."""
+    base_index = request.app.state.index
+    if upload is None:
+        return base_index
+    index, _ = await extend_index(base_index, [upload], doc_type)
+    return index
+
+
 @router.post("/analyze", response_model=ImpactReportResponse)
 async def analyze_change_request(
     request: Request,
-    analyst_prompt: str = Form(...,
-                               description="Descripción del cambio propuesto"),
-    file: UploadFile = File(
-        None,
-        description="Documento PDF, DOC, DOCX, TXT o MD con detalles adicionales",
-    ),
+    analyst_prompt: str = Form(..., description="Descripción del cambio propuesto"),
+    target_system: str | None = Form(None, description="Sistema principal afectado (opcional)"),
+    document_type: str | None = Form(None, description=DOC_TYPE_DESCRIPTION),
+    file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
 ):
+    """Ejecuta el workflow completo y devuelve el reporte de impacto validado."""
+    payload = validate_payload(analyst_prompt, target_system)
+    doc_type = validate_doc_type(document_type)
+    upload = await read_upload(file)
+    uploaded_text = await extract_upload_text(upload) if upload else ""
     try:
-        current_index.set(getattr(request.app.state, "index", None))
-        return await process_analysis(analyst_prompt, file)
-    except HTTPException:
-        # Conserva los códigos HTTP específicos definidos por el procesamiento.
-        raise
+        index = await build_request_index(request, upload, doc_type)
+        report = None
+        async for event in run_agent_workflow_events(
+            payload.analyst_prompt, index,
+            target_system=payload.target_system, uploaded_text=uploaded_text,
+        ):
+            if event["event"] == "report":
+                report = event["report"]
+        return ImpactReportResponse.model_validate(report)
     except Exception as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error interno ejecutando el agente: {str(error)}",
-        )
+        logger.exception("Error en /analyze")
+        raise HTTPException(500, f"Error interno ejecutando el agente: {error}")
 
 
-# Endpoint de progreso que devuelve el análisis mediante Server-Sent Events.
 @router.post("/analyze/stream")
 async def analyze_change_request_stream(
     request: Request,
-    analyst_prompt: str = Form(...,
-                               description="Descripción del cambio propuesto"),
-    file: UploadFile = File(
-        None,
-        description="Documento PDF, DOC, DOCX, TXT o MD con detalles adicionales",
-    ),
+    analyst_prompt: str = Form(..., description="Descripción del cambio propuesto"),
+    target_system: str | None = Form(None, description="Sistema principal afectado (opcional)"),
+    document_type: str | None = Form(None, description=DOC_TYPE_DESCRIPTION),
+    file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
 ):
+    """Server-Sent Events: `progress` por cada paso del agente y `final` con el reporte."""
+    # Validación y lectura del archivo ANTES del stream: errores con código HTTP real
+    # y sin depender de un UploadFile que ya podría estar cerrado.
+    payload = validate_payload(analyst_prompt, target_system)
+    doc_type = validate_doc_type(document_type)
+    upload = await read_upload(file)
+    uploaded_text = await extract_upload_text(upload) if upload else ""
+
     async def event_stream():
-        """Emite las fases del análisis y finalmente el informe o el error."""
-        stages = {
-            "initialize": "Inicializando solicitud de cambio",
-            "retrieve": "Recuperando arquitectura y dependencias",
-            "grade": "Evaluando suficiencia del contexto",
-            "generate": "Generando reporte de impacto",
-        }
-        # Los mensajes informan al cliente qué etapa del análisis está ejecutándose.
-        for _, label in stages.items():
-            yield "event: progress\n" + f"data: {json.dumps(label, ensure_ascii=False)}\n\n"
-
         try:
-            current_index.set(getattr(request.app.state, "index", None))
-            report = await process_analysis(analyst_prompt, file)
-            # Convierte el modelo validado a datos JSON para enviarlo por SSE.
-            final_payload = report.model_dump(mode="json")
-            yield "event: final\ndata: " + json.dumps(final_payload, ensure_ascii=False) + "\n\n"
-        except HTTPException as error:
-            payload = {"type": "error", "detail": error.detail}
-            yield "event: error\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            if upload:
+                yield sse("progress", {"step": "ingest", "message": f"Indexando {upload[0]}"})
+            index = await build_request_index(request, upload, doc_type)
+            async for event in run_agent_workflow_events(
+                payload.analyst_prompt, index,
+                target_system=payload.target_system, uploaded_text=uploaded_text,
+            ):
+                if event["event"] == "progress":
+                    yield sse("progress", {"step": event["step"], "message": event["message"]})
+                else:
+                    report = ImpactReportResponse.model_validate(event["report"])
+                    yield sse("final", report.model_dump(mode="json"))
         except Exception as error:
-            payload = {"type": "error", "detail": str(error)}
-            yield "event: error\ndata: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            logger.exception("Error en /analyze/stream")
+            yield sse("error", {"type": "error", "detail": str(error)})
 
-    # Mantiene la conexión abierta mientras se generan los eventos.
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/documents", response_model=DocumentsResponse, tags=["Documents"])
+async def list_documents(request: Request):
+    """Documentos indexados y el tipo documental asignado a cada uno."""
+    index = request.app.state.index
+    if index is None:
+        return DocumentsResponse(documents=[], total_chunks=0)
+    counts: dict[str, int] = {}
+    for chunk in index.chunks:
+        counts[chunk.source] = counts.get(chunk.source, 0) + 1
+    return DocumentsResponse(
+        documents=[
+            IngestedDocument(filename=name, doc_type=doc_type, chunks=counts[name])
+            for name, doc_type in index.sources.items()
+        ],
+        total_chunks=len(index),
+    )
+
+
+@router.post("/documents", response_model=DocumentsResponse, tags=["Documents"])
+async def upload_documents(
+    request: Request,
+    files: list[UploadFile] = File(..., description=FILE_DESCRIPTION),
+    document_type: str | None = Form(None, description=DOC_TYPE_DESCRIPTION),
+):
+    """Agrega documentos a la base de conocimiento (se guardan en data/ y se indexan)."""
+    doc_type = validate_doc_type(document_type)
+    uploads = [upload for upload in [await read_upload(f) for f in files] if upload]
+    if not uploads:
+        raise HTTPException(422, "No se recibió ningún archivo.")
+    for upload in uploads:
+        await extract_upload_text(upload)  # 422 temprano si alguno no tiene texto
+
+    async with request.app.state.index_lock:
+        index, chunks = await extend_index(request.app.state.index, uploads, doc_type)
+        settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        for filename, data in uploads:
+            (settings.DATA_DIR / filename).write_bytes(data)
+        request.app.state.index = index
+
+    counts: dict[str, IngestedDocument] = {}
+    for chunk in chunks:
+        item = counts.setdefault(chunk.source, IngestedDocument(
+            filename=chunk.source, doc_type=chunk.doc_type, chunks=0))
+        item.chunks += 1
+    return DocumentsResponse(documents=list(counts.values()), total_chunks=len(index))

@@ -1,463 +1,404 @@
-# services/agent_flow.py
+"""Workflow nativo en Python (sin LangGraph) para análisis de impacto de cambios.
 
-import json
-import os
-from typing import TypedDict
+    initialize
+        -> retrieve_specifications_rag
+        -> retrieve_stakeholder_notes_rag
+        -> grade_context --(insuficiente y reintentos < MAX)--> rewrite_query --> retrieve...
+                         --(suficiente o reintentos agotados)--> generate_impact_report
 
-from groq import Groq
-from openai import OpenAI
-from dotenv import load_dotenv
+`run_agent_workflow_events` emite un evento por paso para el streaming SSE;
+`run_agent_workflow` consume esos eventos y devuelve sólo el reporte final.
+"""
+from __future__ import annotations
+
+import logging
+import uuid
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+
 from pydantic import ValidationError
-from schemas.models import LLMImpactReport
-from services.rag import search_similar_chunks
 
-load_dotenv(override=True)
+from config import settings
+from schemas.models import (
+    AgentTrace,
+    ChangeDetails,
+    ConfidenceLevel,
+    ContextGrade,
+    LLMImpactReport,
+    RewrittenQueries,
+)
+from services import llm, rag
+from services.vector_store import HybridIndex
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
-if LLM_PROVIDER == "openai":
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    GENERATION_MODEL = os.environ.get("OPENAI_GENERATION_MODEL", "gpt-4o-mini")
-else:
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-    GENERATION_MODEL = os.environ.get("GENERATION_MODEL", "openai/gpt-oss-20b")
+logger = logging.getLogger(__name__)
 
-
-def provider_options(include_reasoning: bool = True) -> dict:
-    if include_reasoning and LLM_PROVIDER == "groq":
-        return {"reasoning_effort": "low"}
-    return {}
-
-
-def initialize(analyst_prompt: str) -> dict:
-    """
-    Step 1: initialize
-    Captures the analyst's request, extracts proposed change details, 
-    identifies stakeholder perspectives, and sets up execution state.
-    """
-    print("[Agent Step] initialize: Capturing request and setting up state.")
-    return {
-        "original_query": analyst_prompt,
-        "current_query": analyst_prompt,
-        "state": "initialized"
-    }
+COMPANY = "Agentic Airlines SRL"
+UPLOAD_CHAR_BUDGET = 12000
 
 
-def retrieve_specifications_rag(query: str, chunks_store: list[dict]) -> list[dict]:
-    """
-    Step 2: retrieve_specifications_rag
-    Runs custom vector search across system architecture documents and process flows.
-    """
-    print("[Agent Step] retrieve_specifications_rag: Searching architecture and technical specs.")
-    return search_similar_chunks(query, chunks_store, top_k=3)
+def create_request_id() -> str:
+    return f"CHG-{uuid.uuid4().hex[:12].upper()}"
 
 
-def retrieve_stakeholder_notes_rag(query: str, stakeholder_store: list[dict]) -> list[dict]:
-    """
-    Step 3: retrieve_stakeholder_notes_rag
-    Queries dense vector indexes storing stakeholder feedback notes and policy requirements.
-    """
-    print("[Agent Step] retrieve_stakeholder_notes_rag: Querying stakeholder feedback and policies.")
-    return search_similar_chunks(query, stakeholder_store, top_k=2)
+@dataclass
+class AgentState:
+    """Estado de ejecución compartido entre los pasos del workflow."""
+    analyst_prompt: str
+    target_system: str | None = None
+    uploaded_text: str = ""
+    conversation_context: str = ""
+    details: ChangeDetails | None = None
+    spec_query: str = ""
+    stakeholder_query: str = ""
+    tech_chunks: list[dict] = field(default_factory=list)
+    stakeholder_chunks: list[dict] = field(default_factory=list)
+    grade: ContextGrade | None = None
+    rewrites: int = 0
+    trace: AgentTrace = field(default_factory=AgentTrace)
+
+    @property
+    def all_chunks(self) -> list[dict]:
+        return self.tech_chunks + self.stakeholder_chunks
+
+    def request_block(self) -> str:
+        """Texto de la solicitud con todo lo que aportó el analista."""
+        parts = [f"Solicitud del analista: {self.analyst_prompt}"]
+        if self.target_system:
+            parts.append(f"Sistema objetivo indicado: {self.target_system}")
+        if self.conversation_context:
+            parts.append(f"Contexto de la conversación previa:\n{self.conversation_context}")
+        if self.uploaded_text:
+            parts.append(
+                "Documento de solicitud de cambio adjunto (extracto):\n"
+                f"\"\"\"{self.uploaded_text[:UPLOAD_CHAR_BUDGET]}\"\"\"")
+        return "\n\n".join(parts)
 
 
-def grade_context(query: str, context_text: str) -> str:
-    """
-    Step 4: grade_context
-    Runs a targeted LLM evaluation to check if retrieved info provides sufficient detail.
-    """
-    print("[Agent Step] grade_context: Evaluating retrieved context sufficiency.")
-    prompt = f"""
-    Eres un evaluador de calidad para Business Analysts en Agentic Airlines SRL.
-    Evalúa si el contexto permite identificar al menos sistemas afectados, riesgos o controles operativos para preparar un análisis preliminar.
-    No exijas que el cambio específico aparezca literalmente. Responde 'no' solo si el contexto no tiene información técnica ni operativa útil para la consulta.
+# ---------------------------------------------------------------- Paso 1
 
-    Consulta: {query}
-    Contexto: {context_text}
+async def initialize(state: AgentState) -> AgentState:
+    """Captura la solicitud, extrae detalles del cambio y perspectivas de stakeholders,
+    y genera una consulta RAG distinta para especificaciones y para stakeholders."""
+    prompt = f"""Eres Business Analyst senior en {COMPANY}. Analiza la solicitud y extrae
+sus detalles para planificar una búsqueda documental. No inventes sistemas que no se mencionen.
 
-    Responde estrictamente con una sola palabra: 'yes' si es suficiente o 'no' si falta información crítica.
-    """
-    response = client.chat.completions.create(
-        model=GENERATION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-        max_tokens=200,
-        **provider_options()
-    )
-    content = response.choices[0].message.content or ""
-    return content.strip().lower()
+{state.request_block()}
 
-
-def rewrite_query(query: str) -> str:
-    """
-    Step 5: rewrite_query
-    Reformulates vague or incomplete analyst prompts and re-runs RAG retrievals (up to 2 times).
-    """
-    print("[Agent Step] rewrite_query: Reformulating vague or incomplete prompt.")
-    prompt = f"""
-    La siguiente solicitud de cambio de un Business Analyst de Agentic Airlines SRL es ambigua o incompleta. 
-    Por favor, reescribe la consulta añadiendo contexto técnico y términos clave orientados a la arquitectura de una aerolínea.
-    
-    Consulta original: {query}
-    Devuelve únicamente la consulta reescrita, sin texto adicional.
-    """
-    response = client.chat.completions.create(
-        model=GENERATION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=60
-    )
-    return response.choices[0].message.content.strip()
-
-
-def fallback_answer() -> str:
-    """
-    Step 7: fallback_answer
-    Safely replies when technical dependencies or impact data cannot be confirmed.
-    """
-    print("[Agent Step] fallback_answer: Information could not be confirmed.")
-    return "I don't know based on the provided change requests and architecture documents"
-
-
-def classify_message_intent(message: str) -> str:
-    prompt = f"""
-Clasifica el mensaje del usuario para una API de análisis de impacto de Agentic Airlines.
-
-Responde únicamente con una de estas categorías:
-- impact_analysis: solicita analizar, comparar, identificar, evaluar, resumir o explicar cambios, sistemas, dependencias, riesgos, stakeholders o documentos relacionados con impacto de cambios.
-- casual_chat: saludos, charla general, agradecimientos, preguntas personales al asistente, temas ajenos al análisis o solicitudes que el agente no puede realizar.
-
-Mensaje: {message}
-"""
-    response = client.chat.completions.create(
-        model=GENERATION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=20,
-        **provider_options()
-    )
-    intent = (response.choices[0].message.content or "").strip().lower()
-    return "impact_analysis" if "impact_analysis" in intent else "casual_chat"
-
-
-def casual_answer(message: str) -> str:
-    prompt = f"""
-Actúa como asistente de análisis de impacto de cambios de Agentic Airlines.
-Mantén una conversación breve, natural y profesional en español, limitada a un máximo de 60 palabras.
-
-El usuario puede hablar de temas cotidianos o preguntar qué puedes hacer.
-No escribas poemas, código, traducciones, cálculos ajenos, contenidos creativos ni realices ninguna tarea fuera del análisis de impacto.
-Si pide una tarea ajena, responde exactamente con este formato lógico: "No puedo ejecutar esa tarea porque está fuera de mi alcance. Puedo ayudarte a analizar cambios, riesgos, dependencias, stakeholders o documentos de Agentic Airlines."
-Si está relacionada con impacto de cambios, sistemas, riesgos, stakeholders o documentos, conversa con naturalidad y invita a describir el cambio concreto.
-No afirmes haber ejecutado herramientas, leído archivos o realizado acciones que el sistema no haya confirmado.
-
-Mensaje del usuario: {message}
-Responde únicamente el texto destinado al usuario.
-"""
-    response = client.chat.completions.create(
-        model=GENERATION_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-        max_tokens=80,
-        **provider_options()
-    )
-    answer = (response.choices[0].message.content or "").strip()
-    return truncate_casual_answer(answer)
-
-
-def truncate_casual_answer(answer: str, max_words: int = 60) -> str:
-    words = answer.split()
-    if len(words) <= max_words:
-        return answer
-
-    truncated = " ".join(words[:max_words]).rstrip(" ,.;:")
-    last_sentence_end = max(
-        truncated.rfind("."),
-        truncated.rfind("!"),
-        truncated.rfind("?"),
-    )
-    if last_sentence_end >= 0:
-        return truncated[:last_sentence_end + 1]
-    return f"{truncated}."
-
-
-def generate_impact_report(query: str, tech_chunks: list[dict], stakeholder_chunks: list[dict]) -> dict:
-    """
-    Step 6: generate_impact_report
-    Prompts the LLM to synthesize a structured impact analysis report.
-    """
-    print("[Agent Step] generate_impact_report: Synthesizing final structured report with Groq.")
-
-    tech_context = "\n\n---\n\n".join([c['text'] for c in tech_chunks])
-    stakeholder_context = "\n\n---\n\n".join([c['text']
-                                             for c in stakeholder_chunks])
-
-    system_prompt = (
-        "Eres un asistente experto en análisis de impacto para Business Analysts en Agentic Airlines SRL. "
-        "Tu tarea es analizar los cambios propuestos basándote estrictamente en la documentación técnica y notas de stakeholders."
-    )
-
-    user_prompt = f"""
-    Solicitud de Cambio: {query}
-
-    --- Especificaciones Técnicas y Arquitectura ---
-    {tech_context}
-
-    --- Notas de Stakeholders y Políticas ---
-    {stakeholder_context}
-
-    Devuelve exclusivamente un objeto JSON con esta estructura:
-    {{
-      "technical_changes": [{{"description": "...", "affected_system": "..."}}],
-      "risk_level": "Bajo|Medio|Alto|Critico",
-      "affected_stakeholders": [{{"stakeholder": "...", "impact": "...", "severity": "Bajo|Medio|Alto|Critico", "mitigation": "..."}}],
-      "required_mitigations": ["..."],
-      "dependencies": ["..."],
-      "summary_report": "...",
-      "confidence": "Bajo|Medio|Alto",
-      "insufficient_information": false
-    }}
-
-    No inventes información ausente. Limita cada afirmación al contenido recuperado
-    y usa listas vacías cuando no exista evidencia verificable.
-    """
-
-    response = client.chat.completions.create(
-        model=GENERATION_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0.2,
-        max_tokens=1500,
-        **provider_options()
-    )
-    content = response.choices[0].message.content or ""
-    content = content.strip()
-    if content.startswith("```"):
-        content = content.split("```", 2)[1]
-        if content.startswith("json"):
-            content = content[4:]
-        content = content.strip()
+Devuelve JSON con:
+{{
+  "change_summary": "qué se propone cambiar, en 1-3 frases",
+  "affected_systems": ["sistemas, módulos o integraciones mencionados o implícitos"],
+  "stakeholder_perspectives": ["áreas o roles que podrían verse afectados"],
+  "identifiers": ["códigos, normas o IDs mencionados textualmente"],
+  "scope_limits": ["límites de alcance explícitos; vacío si no se indican"],
+  "spec_query": "consulta para buscar componentes, dependencias e integraciones técnicas",
+  "stakeholder_query": "consulta para buscar impactos operativos, políticas y feedback de stakeholders"
+}}"""
     try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start >= 0 and end > start:
-            data = json.loads(content[start:end + 1])
-        else:
-            raise ValueError("El modelo no devolvió un reporte JSON válido")
-
-    try:
-        validated = LLMImpactReport.model_validate(data)
-        return validated.model_dump(mode="json")
-    except ValidationError as validation_error:
-        raise ValueError(
-            "El reporte generado no cumple el contrato de salida"
-        ) from validation_error
-
-
-class AgentState(TypedDict, total=False):
-    original_query: str
-    current_query: str
-    tech_store: list[dict]
-    stakeholder_store: list[dict]
-    tech_retrieved: list[dict]
-    stakeholder_retrieved: list[dict]
-    retry_count: int
-    context_grade: str
-    intent: str
-    allow_casual: bool
-    report: dict
-
-
-def initialize_node(state: AgentState) -> AgentState:
-    initialized = initialize(state["original_query"])
-    intent = "impact_analysis"
-    if state.get("allow_casual", True):
-        intent = classify_message_intent(state["original_query"])
-    return {
-        **state,
-        "current_query": initialized["current_query"],
-        "retry_count": 0,
-        "intent": intent,
-    }
-
-
-def casual_node(state: AgentState) -> AgentState:
-    report = {
-        "technical_changes": [],
-        "risk_level": "Medio",
-        "affected_stakeholders": [],
-        "required_mitigations": [],
-        "dependencies": [],
-        "summary_report": casual_answer(state["original_query"]),
-        "confidence": "Alto",
-        "insufficient_information": False,
-        "sources": [],
-    }
-    return {**state, "report": report}
-
-
-def retrieve_node(state: AgentState) -> AgentState:
-    tech_retrieved = retrieve_specifications_rag(
-        state["current_query"], state["tech_store"]
-    )
-    stakeholder_retrieved = retrieve_stakeholder_notes_rag(
-        state["current_query"], state["stakeholder_store"]
-    )
-    return {
-        **state,
-        "tech_retrieved": tech_retrieved,
-        "stakeholder_retrieved": stakeholder_retrieved,
-    }
-
-
-def grade_node(state: AgentState) -> AgentState:
-    combined_text = "\n".join(
-        chunk["text"]
-        for chunk in state["tech_retrieved"] + state["stakeholder_retrieved"]
-    )
-    context_grade = grade_context(state["current_query"], combined_text)
-    has_both_sources = bool(
-        state["tech_retrieved"] and state["stakeholder_retrieved"])
-    has_enough_context = len(combined_text.strip()) >= 500
-    is_sufficient = "yes" in context_grade or (
-        has_both_sources and has_enough_context)
-    return {**state, "context_grade": "yes" if is_sufficient else "no"}
-
-
-def rewrite_node(state: AgentState) -> AgentState:
-    retry_count = state["retry_count"] + 1
-    return {
-        **state,
-        "current_query": rewrite_query(state["current_query"]),
-        "retry_count": retry_count,
-    }
-
-
-def normalize_generated_report(report: dict, retrieved_chunks: list[dict]) -> dict:
-    has_retrieved_evidence = bool(retrieved_chunks)
-    has_impact_details = bool(
-        report["technical_changes"]
-        or report["affected_stakeholders"]
-        or report["dependencies"]
-    )
-    has_sufficient_information = has_retrieved_evidence and has_impact_details
-
-    report["insufficient_information"] = not has_sufficient_information
-    if not has_sufficient_information:
-        report["summary_report"] = (
-            "El contexto recuperado permite confirmar fuentes disponibles, pero no evidencia suficiente "
-            "para determinar cambios, dependencias o stakeholders con precisión."
+        data = await llm.complete_json(prompt, temperature=0, max_tokens=1200)
+        details = ChangeDetails.model_validate(data)
+    except (ValueError, ValidationError) as error:
+        logger.warning("initialize: respuesta inválida (%s); se usa la consulta original.", error)
+        details = ChangeDetails(
+            change_summary=state.analyst_prompt,
+            affected_systems=[state.target_system] if state.target_system else [],
+            spec_query=state.analyst_prompt,
+            stakeholder_query=state.analyst_prompt,
         )
-        report["confidence"] = "Bajo"
-    elif report["confidence"] not in {"Bajo", "Medio", "Alto"}:
-        report["confidence"] = "Medio"
 
+    if state.target_system and state.target_system not in details.affected_systems:
+        details.affected_systems.insert(0, state.target_system)
+    state.details = details
+    state.spec_query = details.spec_query or state.analyst_prompt
+    state.stakeholder_query = details.stakeholder_query or state.analyst_prompt
+    state.trace.queries.append(RewrittenQueries(
+        spec_query=state.spec_query, stakeholder_query=state.stakeholder_query))
+    return state
+
+
+# ---------------------------------------------------------------- Pasos 2 y 3
+
+def _with_entities(query: str, terms: list[str]) -> str:
+    """Agrega a la consulta los sistemas/IDs extraídos que todavía no contiene."""
+    missing = [term for term in terms if term and term.casefold() not in query.casefold()]
+    return " ".join([query, *missing]).strip()
+
+
+async def retrieve_specifications_rag(state: AgentState, index: HybridIndex | None) -> AgentState:
+    """Busca componentes afectados y dependencias en arquitectura, procesos y solicitudes de cambio."""
+    terms = (state.details.affected_systems + state.details.identifiers) if state.details else []
+    state.tech_chunks = await rag.search_specifications(index, _with_entities(state.spec_query, terms))
+    return state
+
+
+async def retrieve_stakeholder_notes_rag(state: AgentState, index: HybridIndex | None) -> AgentState:
+    """Busca impactos operativos y organizacionales en notas de stakeholders y políticas."""
+    terms = (state.details.stakeholder_perspectives + state.details.identifiers) if state.details else []
+    state.stakeholder_chunks = await rag.search_stakeholder_notes(
+        index,
+        _with_entities(state.stakeholder_query, terms),
+        exclude_ids={chunk["id"] for chunk in state.tech_chunks},
+    )
+    return state
+
+
+# ---------------------------------------------------------------- Paso 4
+
+async def grade_context(state: AgentState) -> AgentState:
+    """Evalúa con el LLM si el contexto recuperado alcanza para un análisis de impacto completo."""
+    if not state.all_chunks:
+        state.grade = ContextGrade(
+            sufficient=False,
+            missing_information=["No se recuperó ningún fragmento relevante de la base documental."],
+            reasoning="Recuperación vacía.",
+        )
+        return state
+
+    prompt = f"""Eres evaluador de calidad de contexto para análisis de impacto en {COMPANY}.
+
+Cambio propuesto: {state.details.change_summary if state.details else state.analyst_prompt}
+
+--- Especificaciones técnicas recuperadas ---
+{rag.format_context(state.tech_chunks)}
+
+--- Notas de stakeholders y políticas recuperadas ---
+{rag.format_context(state.stakeholder_chunks)}
+
+¿El contexto permite identificar (a) los sistemas o componentes afectados y sus dependencias,
+y (b) al menos un impacto operativo, de stakeholder o requisito de política aplicable?
+No exijas que el cambio aparezca literalmente: basta con información técnica y operativa pertinente.
+
+Devuelve JSON:
+{{"sufficient": true|false,
+  "missing_information": ["qué dato concreto falta, p.ej. nombre del sistema, alcance, área afectada"],
+  "reasoning": "una frase"}}"""
+    try:
+        state.grade = ContextGrade.model_validate(
+            await llm.complete_json(prompt, temperature=0, max_tokens=800))
+    except (ValueError, ValidationError) as error:
+        logger.warning("grade_context: respuesta inválida (%s); se asume suficiente.", error)
+        state.grade = ContextGrade(sufficient=True, reasoning="Evaluación no disponible.")
+    state.trace.grade = state.grade
+    return state
+
+
+def should_rewrite(state: AgentState) -> bool:
+    """Decide la siguiente arista del grafo: reescribir o generar."""
+    return bool(state.grade and not state.grade.sufficient
+                and state.rewrites < settings.MAX_QUERY_REWRITES)
+
+
+# ---------------------------------------------------------------- Paso 5
+
+async def rewrite_query(state: AgentState) -> AgentState:
+    """Reformula las consultas usando lo que el evaluador indicó como faltante
+    (p.ej. nombres de sistemas o límites de alcance no explicitados)."""
+    missing = state.grade.missing_information if state.grade else []
+    previous = [query.model_dump() for query in state.trace.queries]
+    prompt = f"""Las búsquedas documentales para este análisis de impacto en {COMPANY} no
+recuperaron información suficiente.
+
+{state.request_block()}
+
+Consultas ya probadas: {previous}
+Información faltante según el evaluador: {missing}
+
+Reformula ambas consultas para cubrir lo faltante: usa sinónimos, nombres de sistemas
+o procesos probables, términos de integración/dependencia y de impacto operativo.
+No repitas consultas ya probadas.
+Devuelve JSON: {{"spec_query": "...", "stakeholder_query": "..."}}"""
+    try:
+        queries = RewrittenQueries.model_validate(
+            await llm.complete_json(prompt, temperature=0.3, max_tokens=800))
+    except (ValueError, ValidationError) as error:
+        logger.warning("rewrite_query: respuesta inválida (%s); se amplía con lo faltante.", error)
+        extra = " ".join(missing)
+        queries = RewrittenQueries(
+            spec_query=f"{state.spec_query} {extra}".strip(),
+            stakeholder_query=f"{state.stakeholder_query} {extra}".strip(),
+        )
+
+    state.spec_query, state.stakeholder_query = queries.spec_query, queries.stakeholder_query
+    state.rewrites += 1
+    state.trace.rewrites = state.rewrites
+    state.trace.queries.append(queries)
+    return state
+
+
+# ---------------------------------------------------------------- Paso 6
+
+def _empty_report(state: AgentState, reason: str) -> dict:
+    return {
+        "summary_report": reason,
+        "risk_level": "Medio",
+        "confidence": "Bajo",
+        "insufficient_information": True,
+        "change_summary": state.details.change_summary if state.details else state.analyst_prompt,
+        "missing_information": state.grade.missing_information if state.grade else [],
+    }
+
+
+async def generate_impact_report(state: AgentState) -> dict:
+    """Sintetiza el reporte estructurado: cambios técnicos, riesgo, stakeholders y mitigaciones."""
+    if not state.all_chunks and not state.uploaded_text:
+        return _empty_report(
+            state,
+            "No hay documentación de arquitectura, solicitudes de cambio ni notas de stakeholders "
+            "relacionadas con esta solicitud. Cargue documentos o precise sistemas y alcance.",
+        )
+
+    insufficient = bool(state.grade and not state.grade.sufficient)
+    system = (
+        f"Eres analista de impacto de cambios en {COMPANY}. Basas cada afirmación "
+        "exclusivamente en el contexto provisto y citas los IDs de fragmento como evidencia. "
+        "Si algo no está respaldado, lo indicas como pregunta abierta en lugar de inventarlo."
+    )
+    details = state.details.model_dump() if state.details else {}
+    prompt = f"""{state.request_block()}
+
+Detalles extraídos del cambio: {details}
+
+--- Especificaciones técnicas, arquitectura y solicitudes de cambio ---
+{rag.format_context(state.tech_chunks)}
+
+--- Notas de stakeholders y políticas ---
+{rag.format_context(state.stakeholder_chunks)}
+
+{"ADVERTENCIA: el contexto fue evaluado como incompleto. Faltante: " + str(state.grade.missing_information) if insufficient else ""}
+
+Criterios de riesgo: Bajo (cambio aislado, sin clientes ni cumplimiento afectados),
+Medio (varios componentes o un área operativa), Alto (sistemas críticos, clientes o
+cumplimiento normativo), Critico (seguridad operacional, pagos o regulación con riesgo de incumplimiento).
+
+Devuelve JSON con esta estructura:
+{{
+  "summary_report": "resumen ejecutivo de 3-6 frases",
+  "technical_changes": [{{"description": "...", "affected_system": "...", "risk_level": "Bajo|Medio|Alto|Critico", "evidence": ["<id de fragmento>"]}}],
+  "risk_level": "Bajo|Medio|Alto|Critico",
+  "risk_justification": "por qué ese nivel",
+  "affected_stakeholders": [{{"stakeholder": "...", "impact": "...", "severity": "Bajo|Medio|Alto|Critico", "mitigation": "..."}}],
+  "required_mitigations": ["..."],
+  "dependencies": ["sistema o proceso dependiente y por qué"],
+  "open_questions": ["información que el analista debe confirmar"],
+  "confidence": "Bajo|Medio|Alto"
+}}"""
+    data = await llm.complete_json(prompt, system=system, temperature=0.2, max_tokens=4000)
+    try:
+        report = LLMImpactReport.model_validate(data).model_dump(mode="json")
+    except ValidationError as error:
+        raise ValueError("El reporte generado no cumple el contrato de salida") from error
+
+    report["change_summary"] = details.get("change_summary", state.analyst_prompt)
+    report["insufficient_information"] = insufficient or not (
+        report["technical_changes"] or report["affected_stakeholders"])
+    report["missing_information"] = state.grade.missing_information if insufficient else []
+    if report["insufficient_information"]:
+        report["confidence"] = ConfidenceLevel.LOW.value
     return report
 
 
-def generate_node(state: AgentState) -> AgentState:
-    retrieved_chunks = state["tech_retrieved"] + state["stakeholder_retrieved"]
-    report = generate_impact_report(
-        state["original_query"],
-        state["tech_retrieved"],
-        state["stakeholder_retrieved"],
-    )
-    report = normalize_generated_report(report, retrieved_chunks)
-    report.setdefault("risk_level", "Medio")
-    report["sources"] = [
-        {
-            "document_id": chunk.get("doc_id", ""),
-            "title": chunk.get("title", ""),
-            "chunk_id": chunk.get("chunk_id"),
-        }
-        for chunk in retrieved_chunks
-    ]
-    return {**state, "report": report}
+# ---------------------------------------------------------------- Orquestación
+
+def _sources(chunks: list[dict]) -> list[dict]:
+    seen, sources = set(), []
+    for chunk in chunks:
+        if chunk["id"] in seen:
+            continue
+        seen.add(chunk["id"])
+        sources.append({
+            "document_id": chunk["source"],
+            "title": chunk.get("section") or chunk["source"],
+            "chunk_id": chunk["id"],
+            "page": chunk.get("page"),
+            "doc_type": chunk.get("doc_type"),
+        })
+    return sources
 
 
-def fallback_node(state: AgentState) -> AgentState:
-    report = {
-        "technical_changes": [],
-        "risk_level": "Medio",
-        "affected_stakeholders": [],
-        "required_mitigations": [],
-        "dependencies": [],
-        "summary_report": fallback_answer(),
-        "confidence": "Bajo",
-        "insufficient_information": True,
-        "sources": [],
-    }
-    return {**state, "report": report}
+def _progress(state: AgentState, step: str, message: str) -> dict:
+    state.trace.steps.append(step)
+    return {"event": "progress", "step": step, "message": message}
 
 
-def route_after_grade(state: AgentState) -> str:
-    if state.get("context_grade") == "yes":
-        return "generate"
-    if state["retry_count"] >= 2:
-        return "fallback"
-    return "rewrite"
-
-
-async def run_agent_workflow(
+async def run_agent_workflow_events(
     analyst_prompt: str,
-    index=None,
-    allow_casual: bool = True,
-) -> dict:
-    """Ejecuta el pipeline nativo sin LangGraph."""
-    from services.embeddings import get_embedding_async
+    index: HybridIndex | None,
+    target_system: str | None = None,
+    uploaded_text: str = "",
+    conversation_context: str = "",
+) -> AsyncIterator[dict]:
+    """Ejecuta el pipeline y emite un evento por paso; el último trae el reporte."""
+    state = AgentState(
+        analyst_prompt=analyst_prompt,
+        target_system=target_system,
+        uploaded_text=uploaded_text,
+        conversation_context=conversation_context,
+    )
 
-    if allow_casual and classify_message_intent(analyst_prompt) == "casual_chat":
-        return casual_node({"original_query": analyst_prompt})["report"]
-    if index is None:
-        return fallback_node({"original_query": analyst_prompt})["report"]
-
-    spec_query = analyst_prompt
-    stakeholder_query = analyst_prompt
-    retrieved_technical = []
-    retrieved_stakeholder = []
-    retry_count = 0
+    yield _progress(state, "initialize", "Extrayendo detalles del cambio y perspectivas de stakeholders")
+    await initialize(state)
 
     while True:
-        from services.rag_service import retrieve_specifications_rag
-        from services.rag_service import retrieve_stakeholder_notes_rag
+        attempt = f" (reintento {state.rewrites})" if state.rewrites else ""
+        yield _progress(state, "retrieve_specifications_rag",
+                        f"Buscando componentes y dependencias técnicas{attempt}")
+        await retrieve_specifications_rag(state, index)
 
-        spec_embedding = await get_embedding_async(spec_query)
-        retrieved_technical = [
-            chunk.model_dump() for chunk in index.search(spec_query, spec_embedding)
-        ]
-        technical_ids = {chunk["id"] for chunk in retrieved_technical}
+        yield _progress(state, "retrieve_stakeholder_notes_rag",
+                        f"Buscando notas de stakeholders y políticas{attempt}")
+        await retrieve_stakeholder_notes_rag(state, index)
 
-        stakeholder_embedding = await get_embedding_async(stakeholder_query)
-        retrieved_stakeholder = [
-            chunk.model_dump() for chunk in index.search(
-                stakeholder_query, stakeholder_embedding, exclude_ids=technical_ids)
-        ]
-        combined = "\n".join(
-            chunk["text"] for chunk in retrieved_technical + retrieved_stakeholder
-        )
-        if grade_context(analyst_prompt, combined).strip().lower().startswith("yes"):
+        yield _progress(state, "grade_context", "Evaluando si el contexto es suficiente")
+        await grade_context(state)
+
+        if not should_rewrite(state):
             break
-        if retry_count >= 2:
-            return fallback_node({"original_query": analyst_prompt})["report"]
-        retry_count += 1
-        spec_query = rewrite_query(spec_query)
-        stakeholder_query = rewrite_query(stakeholder_query)
+        yield _progress(state, "rewrite_query",
+                        f"Contexto incompleto; reformulando consultas ({state.rewrites + 1}/"
+                        f"{settings.MAX_QUERY_REWRITES})")
+        await rewrite_query(state)
 
-    report = generate_impact_report(
-        analyst_prompt, retrieved_technical, retrieved_stakeholder)
-    report["sources"] = [
-        {
-            "document_id": chunk.get("source", ""),
-            "title": chunk.get("section") or chunk.get("source", ""),
-            "chunk_id": chunk.get("id"),
-        }
-        for chunk in retrieved_technical + retrieved_stakeholder
-    ]
-    return normalize_generated_report(
-        report, retrieved_technical + retrieved_stakeholder)
+    yield _progress(state, "generate_impact_report", "Generando reporte de impacto")
+    report = await generate_impact_report(state)
+    report["request_id"] = create_request_id()
+    report["sources"] = _sources(state.all_chunks)
+    report["trace"] = state.trace.model_dump(mode="json")
+    yield {"event": "report", "report": report}
 
 
-print('Setup complete: Full agent workflow with professor requirements ready.')
+async def run_agent_workflow(analyst_prompt: str, index: HybridIndex | None, **kwargs) -> dict:
+    """Versión no streaming: devuelve sólo el reporte final."""
+    report: dict | None = None
+    async for event in run_agent_workflow_events(analyst_prompt, index, **kwargs):
+        if event["event"] == "report":
+            report = event["report"]
+    assert report is not None
+    return report
+
+
+# ---------------------------------------------------------------- Chat conversacional
+
+async def classify_message_intent(message: str) -> str:
+    """Distingue pedidos de análisis de impacto de charla general."""
+    prompt = f"""Clasifica el mensaje para un asistente de análisis de impacto de cambios de {COMPANY}.
+- impact_analysis: pide analizar, evaluar, comparar, resumir o explicar cambios, sistemas,
+  dependencias, riesgos, stakeholders, políticas o documentos.
+- casual_chat: saludos, agradecimientos, preguntas sobre el asistente o temas ajenos.
+
+Mensaje: {message}
+Devuelve JSON: {{"intent": "impact_analysis|casual_chat"}}"""
+    try:
+        data = await llm.complete_json(prompt, temperature=0, max_tokens=300)
+        return "casual_chat" if data.get("intent") == "casual_chat" else "impact_analysis"
+    except ValueError:
+        return "impact_analysis"
+
+
+async def casual_answer(message: str) -> str:
+    prompt = f"""Eres el asistente de análisis de impacto de cambios de {COMPANY}.
+Responde en español, breve (máximo 60 palabras) y profesional. Si piden una tarea ajena al
+análisis de impacto, explica que sólo puedes ayudar con cambios, riesgos, dependencias,
+stakeholders y documentos de la empresa, e invita a describir un cambio concreto.
+
+Mensaje: {message}"""
+    return await llm.complete(prompt, temperature=0.4, max_tokens=600)

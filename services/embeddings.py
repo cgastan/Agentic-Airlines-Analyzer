@@ -1,78 +1,47 @@
-# services/embeddings.py
+"""Embeddings densos: Sentence Transformers local u OpenAI, según EMBEDDING_PROVIDER."""
+from __future__ import annotations
 
-import os
 import asyncio
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-from dotenv import load_dotenv
+from functools import lru_cache
 
-load_dotenv(override=True)
+from config import settings
 
-# Usamos un modelo liviano y gratuito de HuggingFace que corre localmente en Python
-EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
-GENERATION_MODEL = os.environ.get(
-    'GENERATION_MODEL', 'llama-3.3-70b-versatile')
-
-EMBEDDING_PROVIDER = os.environ.get(
-    "EMBEDDING_PROVIDER", "local").strip().lower()
-OPENAI_EMBEDDING_MODEL = os.environ.get(
-    "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-
-encoder = None
-openai_embeddings_client = None
-if EMBEDDING_PROVIDER == "local":
-    encoder = SentenceTransformer(EMBEDDING_MODEL)
-else:
-    openai_embeddings_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+BATCH_SIZE = 64
 
 
-def get_embedding(text: str) -> list[float]:
-    """Genera un embedding mediante el proveedor configurado."""
-    if EMBEDDING_PROVIDER == "openai":
-        response = openai_embeddings_client.embeddings.create(
-            model=OPENAI_EMBEDDING_MODEL,
-            input=text,
-        )
-        return response.data[0].embedding
+@lru_cache(maxsize=1)
+def _local_encoder():
+    # Import diferido: cargar el modelo tarda, así que sólo ocurre al primer uso.
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(settings.EMBEDDING_MODEL)
 
-    embedding = encoder.encode(text)
-    return embedding.tolist()
+
+@lru_cache(maxsize=1)
+def _openai_client():
+    from openai import AsyncOpenAI
+    return AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+async def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Genera embeddings por lotes sin bloquear el event loop."""
+    if not texts:
+        return []
+    if settings.EMBEDDING_PROVIDER.lower() == "openai":
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), BATCH_SIZE):
+            response = await _openai_client().embeddings.create(
+                model=settings.OPENAI_EMBEDDING_MODEL,
+                input=texts[start:start + BATCH_SIZE],
+            )
+            vectors.extend(item.embedding for item in response.data)
+        return vectors
+
+    def encode() -> list[list[float]]:
+        return _local_encoder().encode(texts, batch_size=BATCH_SIZE).tolist()
+
+    return await asyncio.to_thread(encode)
 
 
 async def get_embedding_async(text: str) -> list[float]:
-    """Ejecuta embeddings locales sin bloquear el event loop."""
-    if EMBEDDING_PROVIDER == "openai":
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        response = await client.embeddings.create(
-            model=OPENAI_EMBEDDING_MODEL,
-            input=text,
-        )
-        return response.data[0].embedding
-    return await asyncio.to_thread(get_embedding, text)
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Calcula la similitud de coseno entre dos vectores (exactamente como lo tenías)."""
-    denominator = np.linalg.norm(a) * np.linalg.norm(b)
-    if denominator == 0:
-        return 0.0
-    return float(np.dot(a, b) / denominator)
-
-
-def embed_chunks(chunks: list[dict]) -> list[dict]:
-    """Recorre los chunks de tus documentos y les añade el vector embedding."""
-    for chunk in chunks:
-        # Genera el vector local y lo convierte en un array de numpy de 32 bits
-        chunk['embedding'] = np.array(
-            get_embedding(chunk['text']), dtype=np.float32)
-
-    print(f'Generated embeddings for {len(chunks)} chunks.')
-    if chunks:
-        print(f"Embedding size: {len(chunks[0]['embedding'])}")
-
-    return chunks
-
-
-print('Setup complete: Embeddings service ready.')
+    """Embedding de una sola consulta."""
+    return (await embed_texts([text]))[0]

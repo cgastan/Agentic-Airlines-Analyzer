@@ -1,8 +1,9 @@
-"""Índice híbrido denso y BM25."""
+"""Índice vectorial denso en memoria combinado con BM25 mediante Reciprocal Rank Fusion."""
 from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Iterable
 
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -11,75 +12,101 @@ from config import settings
 from services.chunking import Chunk, extract_identifiers
 
 
-def normalize_number(number: str) -> str:
-    """Convierte puntuación legal en una forma buscable consistente."""
-    return number.replace(".", "").replace(",", "").replace("-", "")
-
-
 def tokenize(text: str) -> list[str]:
-    """Tokeniza conservando códigos y normalizando números y acentos."""
+    """Tokeniza sin acentos ni mayúsculas, conservando códigos y números normativos."""
     text = unicodedata.normalize("NFKD", text.casefold())
-    text = "".join(character for character in text if not unicodedata.combining(character))
-    tokens = re.findall(r"[a-z]+(?:-[a-z0-9]+)*|\d+(?:[.-]\d+)+|\d+", text)
-    return [
-        normalize_number(token) if re.fullmatch(r"\d+(?:[.-]\d+)+|\d+", token) else token
-        for token in tokens
-    ]
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    tokens = re.findall(r"[a-z0-9]+(?:[.\-/][a-z0-9]+)*", text)
+    # "18.331" y "18331" deben coincidir.
+    return [re.sub(r"(?<=\d)[.\-/](?=\d)", "", token) for token in tokens]
+
+
+def reciprocal_rank_fusion(rankings: Iterable[list[int]], k: int | None = None) -> dict[int, float]:
+    """Combina rankings: score(d) = sum(1 / (k + rank_i(d)))."""
+    k = k or settings.RRF_K
+    scores: dict[int, float] = {}
+    for ranking in rankings:
+        for rank, index in enumerate(ranking, start=1):
+            scores[index] = scores.get(index, 0.0) + 1.0 / (k + rank)
+    return scores
 
 
 class HybridIndex:
-    """Combina similitud densa, BM25, identificadores exactos y etiquetas."""
+    """Matriz de embeddings normalizados + BM25 + bonus por identificadores exactos."""
+
+    IDENTIFIER_BONUS = 0.05
 
     def __init__(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         if not chunks:
-            raise ValueError("El índice híbrido requiere al menos un documento legible.")
+            raise ValueError("El índice requiere al menos un fragmento.")
+        if len(chunks) != len(embeddings):
+            raise ValueError("Cantidad de chunks y embeddings no coincide.")
         matrix = np.asarray(embeddings, dtype=np.float32)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        # Una fila cero no debe producir divisiones por cero durante la búsqueda.
         self.embeddings = np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms != 0)
-        self.chunks = chunks
-        self.bm25 = BM25Okapi([tokenize(chunk.context_text) for chunk in chunks])
+        self.chunks = list(chunks)
+        self.bm25 = BM25Okapi([tokenize(chunk.context_text) for chunk in self.chunks])
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+    @property
+    def sources(self) -> dict[str, str]:
+        """Documento -> tipo documental, para inspección vía API."""
+        return {chunk.source: chunk.doc_type for chunk in self.chunks}
+
+    def merged_with(self, chunks: list[Chunk], embeddings: list[list[float]]) -> "HybridIndex":
+        """Devuelve un índice nuevo con fragmentos adicionales, sin mutar el actual.
+
+        Si un documento ya existía (mismo nombre), se reemplaza por la nueva versión.
+        """
+        new_sources = {chunk.source for chunk in chunks}
+        keep = [i for i, chunk in enumerate(self.chunks) if chunk.source not in new_sources]
+        return HybridIndex(
+            [self.chunks[i] for i in keep] + list(chunks),
+            [self.embeddings[i].tolist() for i in keep] + list(embeddings),
+        )
 
     def search(
         self,
         query: str,
         query_embedding: list[float],
-        top_k: int | None = None,
-        pool: int | None = None,
+        top_k: int = 5,
+        doc_types: set[str] | None = None,
         exclude_ids: set[str] | None = None,
-        preferred_tags: list[str] | None = None,
     ) -> list[Chunk]:
-        top_k = top_k or settings.TOP_K
-        pool = pool or settings.POOL_SIZE
+        """Búsqueda híbrida. doc_types restringe el corpus (p.ej. sólo especificaciones).
+
+        Si el filtro deja el corpus vacío, se busca en todos los documentos para no
+        devolver contexto vacío por una clasificación documental incompleta.
+        """
         exclude_ids = exclude_ids or set()
-        candidates = [index for index, chunk in enumerate(self.chunks) if chunk.id not in exclude_ids]
+        available = [i for i, c in enumerate(self.chunks) if c.id not in exclude_ids]
+        candidates = [i for i in available if not doc_types or self.chunks[i].doc_type in doc_types]
+        if not candidates:
+            candidates = available
         if not candidates:
             return []
 
         vector = np.asarray(query_embedding, dtype=np.float32)
         norm = np.linalg.norm(vector)
         vector = vector / norm if norm else vector
-        dense_scores = self.embeddings[candidates] @ vector
+        dense_scores = self.embeddings @ vector
+        lexical_scores = np.asarray(self.bm25.get_scores(tokenize(query)))
 
-        bm25_scores = np.asarray(self.bm25.get_scores(tokenize(query)))
-        dense_ranking = sorted(candidates, key=lambda index: (-dense_scores[candidates.index(index)], index))
-        lexical_ranking = sorted(candidates, key=lambda index: (-bm25_scores[index], index))
+        pool = settings.POOL_SIZE
+        dense_ranking = sorted(candidates, key=lambda i: -dense_scores[i])[:pool]
+        lexical_ranking = [
+            i for i in sorted(candidates, key=lambda i: -lexical_scores[i]) if lexical_scores[i] > 0
+        ][:pool]
+        scores = reciprocal_rank_fusion([dense_ranking, lexical_ranking])
 
-        scores: dict[int, float] = {}
-        for rank, index in enumerate(dense_ranking[:pool], start=1):
-            scores[index] = scores.get(index, 0.0) + 1.0 / (settings.RRF_K + rank)
-        for rank, index in enumerate(lexical_ranking[:pool], start=1):
-            scores[index] = scores.get(index, 0.0) + 1.0 / (settings.RRF_K + rank)
-
+        # Un identificador exacto (ej. "ARQ-SIS-001") supera una distancia semántica desfavorable.
         query_ids = {identifier.casefold() for identifier in extract_identifiers(query)}
-        preferred = set(preferred_tags or [])
-        for index in candidates:
-            chunk = self.chunks[index]
-            if query_ids.intersection(identifier.casefold() for identifier in chunk.identifiers):
-                scores[index] = scores.get(index, 0.0) + 0.08
-            if preferred.intersection(chunk.tags):
-                scores[index] = scores.get(index, 0.0) + 0.03
+        if query_ids:
+            for i in candidates:
+                if query_ids & {x.casefold() for x in self.chunks[i].identifiers}:
+                    scores[i] = scores.get(i, 0.0) + self.IDENTIFIER_BONUS
 
-        # El match exacto puede superar una distancia semántica desfavorable.
-        ranked = sorted(candidates, key=lambda index: (-scores.get(index, 0.0), index))
-        return [self.chunks[index] for index in ranked[:top_k]]
+        ranked = sorted(scores, key=lambda i: (-scores[i], i))
+        return [self.chunks[i] for i in ranked[:top_k]]

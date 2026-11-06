@@ -33,10 +33,6 @@ class FakeLLM:
         self.grade_sufficient = True
 
     async def __call__(self, prompt, system=None, **kwargs):
-        if "Clasifica el mensaje" in prompt:
-            self.calls.append("classify_intent")
-            intent = "casual_chat" if "hola" in prompt.lower() else "impact_analysis"
-            return json.dumps({"intent": intent})
         if "planificar una búsqueda documental" in prompt:
             self.calls.append("initialize")
             return json.dumps({

@@ -6,7 +6,6 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from main import app
-from services.context_service import session_store
 from tests.test_core import ARCH, POLICY
 
 
@@ -16,7 +15,6 @@ def client(fake_llm):
     (settings.DATA_DIR / "pol.txt").write_text(POLICY, encoding="utf-8")
     with TestClient(app) as test_client:  # ejecuta el lifespan (build_index)
         yield test_client
-    session_store.clear()
 
 
 def events(text: str) -> list[tuple[str, object]]:
@@ -83,14 +81,27 @@ def test_documents_endpoint_adds_to_knowledge_base(client):
     assert (settings.DATA_DIR / "notas.txt").exists()
 
 
-def test_chat_casual_and_impact(client):
-    casual = client.post("/api/chat", json={"message": "hola!"}).json()
-    assert casual["intent"] == "casual_chat" and casual["report"] is None
+def test_chat_returns_readable_text_and_structured_report(client):
+    body = client.post("/api/chat", json={"message": "¿Qué impacto tiene migrar reservas?"}).json()
+    assert "Nivel de riesgo: Alto" in body["answer"]
+    assert body["report"]["risk_level"] == "Alto" and body["sources"]
 
-    impact = client.post("/api/chat", json={"message": "¿Qué impacto tiene migrar reservas?"}).json()
-    assert impact["intent"] == "impact_analysis"
-    assert "Nivel de riesgo: Alto" in impact["answer"]
-    assert len(session_store) == 1  # misma sesión vía cookie
+
+def test_chat_uses_client_history_and_keeps_no_server_state(client, fake_llm):
+    first = client.post("/api/chat", json={"message": "¿Qué impacto tiene migrar reservas?"})
+    assert fake_llm.calls.count("other") == 0          # sin historial no se reformula nada
+    assert "set-cookie" not in first.headers           # sin sesión ni cookie
+
+    history = [{"role": "user", "content": "¿Qué impacto tiene migrar reservas?"},
+               {"role": "assistant", "content": first.json()["answer"]}]
+    follow_up = client.post("/api/chat", json={"message": "¿y qué riesgo tiene eso?", "history": history})
+    assert follow_up.status_code == 200, follow_up.text
+    assert fake_llm.calls.count("other") == 1          # una reformulación de la consulta
+
+
+def test_chat_rejects_invalid_history_role(client):
+    bad = {"message": "x", "history": [{"role": "system", "content": "y"}]}
+    assert client.post("/api/chat", json=bad).status_code == 422
 
 
 def test_chat_stream_finishes_with_final_event(client):

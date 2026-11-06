@@ -261,3 +261,29 @@ def test_missing_openai_key_fails_fast_with_clear_message(monkeypatch):
         check_embedding_config()
     monkeypatch.setattr(settings, "OPENAI_API_KEY", "sk-test")
     check_embedding_config()
+
+
+# ---------- Contexto del chat (sin estado) ----------
+
+def test_history_keeps_recent_messages_and_summarizes_old_ones(fake_llm, monkeypatch):
+    from config import CONTEXT_TOKEN_BUDGETS
+    from schemas.models import ConversationMessage
+    from services import context_service
+
+    monkeypatch.setitem(CONTEXT_TOKEN_BUDGETS, "history", 120)
+    monkeypatch.setattr(context_service, "MESSAGE_TOKEN_CAP", 40)
+    history = [ConversationMessage(role="user" if i % 2 == 0 else "assistant",
+                                   content=f"mensaje número {i} " * 10) for i in range(10)]
+
+    context = run(context_service.build_context(history))
+
+    assert "mensaje número 9" in context and "mensaje número 0" not in context
+    assert "Resumen previo" in context            # lo antiguo se condensó con el LLM
+    assert fake_llm.calls.count("other") == 1
+
+
+def test_no_history_means_no_llm_calls(fake_llm):
+    from services import context_service
+    assert run(context_service.build_context([])) == ""
+    assert run(context_service.standalone_query("hola", "")) == "hola"
+    assert fake_llm.calls == []

@@ -59,10 +59,8 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Presupuestos de tokens para la memoria conversacional del chat.
+# Presupuestos de tokens para el contexto del chat (historial enviado por el cliente).
 CONTEXT_TOKEN_BUDGETS = {
     "summary": 600,
     "history": 2000,
-    "rag": 5000,
-    "uploaded_document": 3000,
 }

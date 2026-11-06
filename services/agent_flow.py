@@ -394,31 +394,3 @@ async def run_agent_workflow(analyst_prompt: str, index: HybridIndex | None, **k
             report = event["report"]
     assert report is not None
     return report
-
-
-# ---------------------------------------------------------------- Chat conversacional
-
-async def classify_message_intent(message: str) -> str:
-    """Distingue pedidos de análisis de impacto de charla general."""
-    prompt = f"""Clasifica el mensaje para un asistente de análisis de impacto de cambios de {COMPANY}.
-- impact_analysis: pide analizar, evaluar, comparar, resumir o explicar cambios, sistemas,
-  dependencias, riesgos, stakeholders, políticas o documentos.
-- casual_chat: saludos, agradecimientos, preguntas sobre el asistente o temas ajenos.
-
-Mensaje: {message}
-Devuelve JSON: {{"intent": "impact_analysis|casual_chat"}}"""
-    try:
-        data = await llm.complete_json(prompt, temperature=0, max_tokens=300)
-        return "casual_chat" if data.get("intent") == "casual_chat" else "impact_analysis"
-    except ValueError:
-        return "impact_analysis"
-
-
-async def casual_answer(message: str) -> str:
-    prompt = f"""Eres el asistente de análisis de impacto de cambios de {COMPANY}.
-Responde en español, breve (máximo 60 palabras) y profesional. Si piden una tarea ajena al
-análisis de impacto, explica que sólo puedes ayudar con cambios, riesgos, dependencias,
-stakeholders y documentos de la empresa, e invita a describir un cambio concreto.
-
-Mensaje: {message}"""
-    return await llm.complete(prompt, temperature=0.4, max_tokens=600)

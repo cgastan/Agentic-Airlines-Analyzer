@@ -66,8 +66,17 @@ class ChangeRequestPayload(BaseModel):
         return clean_system_name(value)
 
 
+class ConversationMessage(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(max_length=20000)
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
+    history: List[ConversationMessage] = Field(
+        default_factory=list, max_length=40,
+        description="Mensajes previos de la conversación, en orden. El cliente los guarda y los reenvía "
+                    "(se pierden al recargar la pantalla). Vacío en el primer mensaje.")
     target_system: Optional[str] = Field(
         None, max_length=200, description=TARGET_SYSTEM_DESCRIPTION, examples=TARGET_SYSTEM_EXAMPLES)
 
@@ -160,26 +169,8 @@ class ImpactReportResponse(LLMImpactReport):
 
 # ---------- Chat ----------
 
-class ConversationMessage(BaseModel):
-    role: str = Field(pattern="^(user|assistant)$")
-    content: str
-
-
-class SessionState(BaseModel):
-    session_id: str
-    change_request_id: Optional[str] = None
-    systems: List[str] = Field(default_factory=list)
-    stakeholders: List[str] = Field(default_factory=list)
-    risk_level: Optional[RiskLevel] = None
-    summary: str = ""
-    messages: List[ConversationMessage] = Field(default_factory=list)
-    last_report: Optional[ImpactReportResponse] = None
-
-
 class ChatResponse(BaseModel):
-    session_id: str
     answer: str
-    intent: str = "impact_analysis"
     report: Optional[ImpactReportResponse] = None
     sources: List[SourceReference] = Field(default_factory=list)
     insufficient_information: bool = False

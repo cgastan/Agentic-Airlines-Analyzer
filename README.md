@@ -9,7 +9,7 @@ solicitudes de cambio, especificaciones de arquitectura, notas de stakeholders y
 ```
 routers/
   analysis.py   POST /api/analyze, /api/analyze/stream (SSE), GET|POST /api/documents
-  chat.py       POST /api/chat, /api/chat/stream (SSE) con memoria de sesión
+  chat.py       POST /api/chat, /api/chat/stream (SSE): el mismo workflow con contexto de conversación
 services/
   readers.py           extracción de texto PDF/DOCX/DOC/TXT/MD con página y sección
   chunking.py          fragmentación con solapamiento, conservando archivo/página/sección
@@ -19,7 +19,7 @@ services/
   rag.py               funciones de recuperación del agente
   agent_flow.py        workflow del agente (6 pasos) con llamadas directas al LLM
   llm.py               cliente único Groq/OpenAI, modo JSON
-  context_service.py   memoria conversacional (historial acotado + resumen)
+  context_service.py   contexto del chat sin estado: historial del cliente -> recientes + resumen
 schemas/models.py      contratos Pydantic de entrada, estado del agente y reporte
 ```
 
@@ -78,7 +78,7 @@ Documentación interactiva: http://127.0.0.1:8000/docs. Los documentos de `data/
 |---|---|---|
 | POST | `/api/analyze` | multipart: `analyst_prompt`, `target_system?`, `file?` → `ImpactReportResponse` |
 | POST | `/api/analyze/stream` | igual, en SSE: eventos `progress` (uno por paso real del agente), `final`, `error` |
-| POST | `/api/chat` | JSON `{"message", "target_system?"}`; sesión por cookie |
+| POST | `/api/chat` | JSON `{"message", "target_system?", "history?"}` -> texto legible + reporte. `history` = mensajes previos `[{role, content}]` que guarda el cliente (se pierden al recargar) |
 | POST | `/api/chat/stream` | SSE: `progress`, `text`, `final` |
 | GET | `/api/documents` | documentos indexados y cantidad de chunks |
 | POST | `/api/documents` | agrega archivos a la base de conocimiento (`data/`) |

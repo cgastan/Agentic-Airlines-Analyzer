@@ -87,21 +87,24 @@ def test_chat_returns_readable_text_and_structured_report(client):
     assert body["report"]["risk_level"] == "Alto" and body["sources"]
 
 
-def test_chat_uses_client_history_and_keeps_no_server_state(client, fake_llm):
+def test_chat_remembers_the_conversation_through_session_id(client, fake_llm):
     first = client.post("/api/chat", json={"message": "¿Qué impacto tiene migrar reservas?"})
+    session_id = first.json()["session_id"]
+    assert session_id                                  # el servidor entrega un id nuevo
     assert fake_llm.calls.count("other") == 0          # sin historial no se reformula nada
-    assert "set-cookie" not in first.headers           # sin sesión ni cookie
 
-    history = [{"role": "user", "content": "¿Qué impacto tiene migrar reservas?"},
-               {"role": "assistant", "content": first.json()["answer"]}]
-    follow_up = client.post("/api/chat", json={"message": "¿y qué riesgo tiene eso?", "history": history})
+    follow_up = client.post("/api/chat", json={"message": "¿y qué riesgo tiene eso?",
+                                               "session_id": session_id})
     assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["session_id"] == session_id
     assert fake_llm.calls.count("other") == 1          # una reformulación de la consulta
 
 
-def test_chat_rejects_invalid_history_role(client):
-    bad = {"message": "x", "history": [{"role": "system", "content": "y"}]}
-    assert client.post("/api/chat", json=bad).status_code == 422
+def test_chat_sessions_are_independent(client, fake_llm):
+    client.post("/api/chat", json={"message": "¿Qué impacto tiene migrar reservas?"})
+    other = client.post("/api/chat", json={"message": "¿Qué impacto tiene migrar pagos?"})
+    assert fake_llm.calls.count("other") == 0          # otra conversación: no hereda contexto
+    assert other.json()["session_id"]
 
 
 def test_chat_stream_finishes_with_final_event(client):

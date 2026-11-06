@@ -24,7 +24,8 @@ def _reasoning_options() -> dict:
     effort = settings.LLM_REASONING_EFFORT.strip().lower()
     model = settings.generation_model.lower()
     if effort == "auto":
-        is_reasoning_model = "gpt-oss" in model or model.startswith(("o1", "o3", "o4"))
+        is_reasoning_model = "gpt-oss" in model or model.startswith(
+            ("o1", "o3", "o4"))
         return {"reasoning_effort": "low"} if is_reasoning_model else {}
     if effort in {"", "none", "off"}:
         return {}

@@ -73,10 +73,11 @@ class ConversationMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
-    history: List[ConversationMessage] = Field(
-        default_factory=list, max_length=40,
-        description="Mensajes previos de la conversación, en orden. El cliente los guarda y los reenvía "
-                    "(se pierden al recargar la pantalla). Vacío en el primer mensaje.")
+    session_id: Optional[str] = Field(
+        None, max_length=64,
+        description="Identifica la conversación. Déjalo vacío en el primer mensaje: la respuesta trae un "
+                    "`session_id`; reutilízalo en los siguientes para que el agente recuerde el contexto. "
+                    "Se guarda en memoria del servidor (se pierde al reiniciarlo).")
     target_system: Optional[str] = Field(
         None, max_length=200, description=TARGET_SYSTEM_DESCRIPTION, examples=TARGET_SYSTEM_EXAMPLES)
 
@@ -171,6 +172,7 @@ class ImpactReportResponse(LLMImpactReport):
 
 class ChatResponse(BaseModel):
     answer: str
+    session_id: str = ""              # reenviar en el siguiente mensaje para mantener el contexto
     intent: str = "impact_analysis"   # impact_analysis | casual_chat | off_topic
     report: Optional[ImpactReportResponse] = None
     sources: List[SourceReference] = Field(default_factory=list)

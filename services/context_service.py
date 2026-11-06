@@ -1,12 +1,14 @@
-"""Contexto conversacional SIN ESTADO en el servidor.
+"""Contexto conversacional por sesión, guardado en memoria del servidor.
 
-El cliente envía el historial en cada mensaje (se pierde al recargar la pantalla, a propósito).
-El servicio lo ajusta a un presupuesto de tokens: conserva los mensajes más recientes y
-condensa los más antiguos en un resumen generado por el LLM.
+Cada conversación se identifica con un `session_id`. El historial se ajusta a un presupuesto de
+tokens: se conservan los mensajes más recientes y los más antiguos se condensan en un resumen
+generado por el LLM.
 """
 from __future__ import annotations
 
 import logging
+import uuid
+from collections import OrderedDict
 
 import tiktoken
 
@@ -19,6 +21,29 @@ encoding = tiktoken.get_encoding("o200k_base")
 
 # Un reporte previo puede ser largo: se limita cada mensaje para que quepan varios turnos.
 MESSAGE_TOKEN_CAP = CONTEXT_TOKEN_BUDGETS["history"] // 3
+
+
+MAX_SESSIONS = 200          # al superarse, se descarta la sesión menos usada
+MAX_MESSAGES_PER_SESSION = 40
+_sessions: OrderedDict[str, list[ConversationMessage]] = OrderedDict()
+
+
+def get_history(session_id: str | None) -> tuple[str, list[ConversationMessage]]:
+    """Devuelve (session_id, historial). Sin id, o con uno desconocido, la sesión empieza vacía."""
+    if session_id and session_id in _sessions:
+        _sessions.move_to_end(session_id)
+        return session_id, list(_sessions[session_id])
+    return session_id or uuid.uuid4().hex, []
+
+
+def save_turn(session_id: str, user_message: str, answer: str) -> None:
+    history = _sessions.setdefault(session_id, [])
+    history += [ConversationMessage(role="user", content=user_message),
+                ConversationMessage(role="assistant", content=answer)]
+    del history[:-MAX_MESSAGES_PER_SESSION]
+    _sessions.move_to_end(session_id)
+    while len(_sessions) > MAX_SESSIONS:
+        _sessions.popitem(last=False)
 
 
 def count_tokens(text: str) -> int:

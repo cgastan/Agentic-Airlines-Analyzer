@@ -40,6 +40,8 @@ UPLOAD_CHAR_BUDGET = 12000
 def create_request_id() -> str:
     return f"CHG-{uuid.uuid4().hex[:12].upper()}"
 
+#
+
 
 @dataclass
 class AgentState:
@@ -98,6 +100,7 @@ Devuelve JSON con:
 }}"""
     try:
         data = await llm.complete_json(prompt, temperature=0, max_tokens=1200)
+        # aca se valida que el JSON cumpla con el modelo ChangeDetails
         details = ChangeDetails.model_validate(data)
     except (ValueError, ValidationError) as error:
         logger.warning(

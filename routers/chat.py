@@ -14,7 +14,7 @@ from services.agent_flow import (
     classify_message_intent,
     run_agent_workflow_events,
 )
-from services.context_service import build_context, standalone_query
+from services.context_service import build_context, get_history, save_turn, standalone_query
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["Chat"])
@@ -49,13 +49,16 @@ def format_readable_report(report: ImpactReportResponse) -> str:
 
 async def run_chat_turn(payload: ChatRequest, request: Request):
     """Generador común a /chat y /chat/stream: eventos de progreso y respuesta final."""
-    context = await build_context(payload.history) if payload.history else ""
+    session_id, history = get_history(payload.session_id)
+    context = await build_context(history) if history else ""
 
     intent = await classify_message_intent(payload.message, context)
     if intent != "impact_analysis":
         # Charla casual: respuesta corta del LLM. Tema ajeno: texto fijo, sin pasar por el LLM.
         answer = await casual_answer(payload.message) if intent == "casual_chat" else OFF_TOPIC_REPLY
-        yield {"event": "result", "response": ChatResponse(answer=answer, intent=intent)}
+        save_turn(session_id, payload.message, answer)
+        yield {"event": "result",
+               "response": ChatResponse(answer=answer, intent=intent, session_id=session_id)}
         return
 
     query = payload.message
@@ -72,8 +75,11 @@ async def run_chat_turn(payload: ChatRequest, request: Request):
             yield event
             continue
         report = ImpactReportResponse.model_validate(event["report"])
+        answer = format_readable_report(report)
+        save_turn(session_id, payload.message, answer)
         yield {"event": "result", "response": ChatResponse(
-            answer=format_readable_report(report),
+            answer=answer,
+            session_id=session_id,
             intent=intent,
             report=report,
             sources=report.sources,

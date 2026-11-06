@@ -8,7 +8,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from schemas.models import ChatRequest, ChatResponse, ImpactReportResponse
-from services.agent_flow import run_agent_workflow_events
+from services.agent_flow import (
+    OFF_TOPIC_REPLY,
+    casual_answer,
+    classify_message_intent,
+    run_agent_workflow_events,
+)
 from services.context_service import build_context, standalone_query
 
 logger = logging.getLogger(__name__)
@@ -44,12 +49,19 @@ def format_readable_report(report: ImpactReportResponse) -> str:
 
 async def run_chat_turn(payload: ChatRequest, request: Request):
     """Generador común a /chat y /chat/stream: eventos de progreso y respuesta final."""
-    context = ""
+    context = await build_context(payload.history) if payload.history else ""
+
+    intent = await classify_message_intent(payload.message, context)
+    if intent != "impact_analysis":
+        # Charla casual: respuesta corta del LLM. Tema ajeno: texto fijo, sin pasar por el LLM.
+        answer = await casual_answer(payload.message) if intent == "casual_chat" else OFF_TOPIC_REPLY
+        yield {"event": "result", "response": ChatResponse(answer=answer, intent=intent)}
+        return
+
     query = payload.message
-    if payload.history:
+    if context:
         yield {"event": "progress", "step": "context",
                "message": "Resolviendo el contexto de la conversación"}
-        context = await build_context(payload.history)
         query = await standalone_query(payload.message, context)
 
     async for event in run_agent_workflow_events(
@@ -62,6 +74,7 @@ async def run_chat_turn(payload: ChatRequest, request: Request):
         report = ImpactReportResponse.model_validate(event["report"])
         yield {"event": "result", "response": ChatResponse(
             answer=format_readable_report(report),
+            intent=intent,
             report=report,
             sources=report.sources,
             insufficient_information=report.insufficient_information,

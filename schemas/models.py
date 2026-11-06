@@ -171,6 +171,7 @@ class ImpactReportResponse(LLMImpactReport):
 
 class ChatResponse(BaseModel):
     answer: str
+    intent: str = "impact_analysis"   # impact_analysis | casual_chat | off_topic
     report: Optional[ImpactReportResponse] = None
     sources: List[SourceReference] = Field(default_factory=list)
     insufficient_information: bool = False

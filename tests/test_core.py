@@ -3,7 +3,7 @@ from pydantic import ValidationError
 from schemas.models import ImpactReportResponse, RiskLevel
 from services.agent_flow import normalize_generated_report, route_after_grade
 from services.chunking import build_chunks_from_documents, chunk_text
-from services.rag import reciprocal_rank_fusion
+from services.rag import build_exact_match_ranking, reciprocal_rank_fusion
 
 
 def test_chunk_text_without_overlap_returns_complete_content():
@@ -44,6 +44,32 @@ def test_rrf_combines_lexical_and_vector_rankings():
 
     assert set(fused) == {0, 1}
     assert fused[0] in {0, 1}
+
+
+def test_exact_match_ranking_prioritizes_skybus():
+    chunks = [
+        {"text": "Los sistemas usan rutas REST y eventos."},
+        {"text": "SkyBus conecta todos los sistemas de la aerolínea."},
+        {"text": "Skybus permite la comunicación entre servicios."},
+    ]
+
+    ranking = build_exact_match_ranking("SkyBus", chunks)
+
+    assert ranking.index(1) < ranking.index(0)
+    assert ranking.index(2) < ranking.index(0)
+
+
+def test_exact_identifier_is_retrieved_for_law_number():
+    chunks = [
+        {"text": "La política regula cambios generales y aprobaciones."},
+        {"text": "Ley 18.331 protege los datos personales."},
+        {"text": "Defensa del consumidor (Ley 17.250)."},
+    ]
+
+    ranking = build_exact_match_ranking(
+        "¿Qué exige la Ley 17.250?", chunks)
+
+    assert ranking[0] == 2
 
 
 def test_valid_impact_report_passes_pydantic_validation():

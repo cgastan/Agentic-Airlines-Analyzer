@@ -1,8 +1,9 @@
 # routers/analysis.py
 
-import uuid
+import uuid  # genera identificadores únicos
+import inspect
 
-from fastapi import APIRouter, Cookie, HTTPException, Response
+from fastapi import APIRouter, Cookie, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from schemas.models import (
@@ -17,7 +18,6 @@ from services.context_service import (
     prepare_context_message,
     record_report_turn,
 )
-from services.document_stores import operational_chunks, technical_chunks
 
 router = APIRouter(prefix="/api", tags=["Impact Analysis"])
 
@@ -45,6 +45,7 @@ def get_unique_sources(report: ImpactReportResponse) -> list[SourceReference]:
 async def chat(
     payload: ChatRequest,
     response: Response,
+    request: Request,
     chat_session_id: str | None = Cookie(default=None),
 ):
     """Consulta conversacional con respuesta en texto y fuentes."""
@@ -60,11 +61,11 @@ async def chat(
         if payload.target_system:
             prompt = f"Sistema objetivo: {payload.target_system}. {prompt}"
 
-        report = run_agent_workflow(
+        workflow = run_agent_workflow(
             analyst_prompt=prompt,
-            tech_store=technical_chunks,
-            stakeholder_store=operational_chunks
+            index=request.app.state.index,
         )
+        report = await workflow if inspect.isawaitable(workflow) else workflow
         report["request_id"] = create_request_id()
         validated = ImpactReportResponse.model_validate(report)
         record_report_turn(state, payload.message, validated)
@@ -131,6 +132,7 @@ def format_readable_report(report: ImpactReportResponse) -> tuple[str, list[dict
 @router.post("/chat/stream")
 async def chat_stream(
     payload: ChatRequest,
+    request: Request,
     chat_session_id: str | None = Cookie(default=None),
 ):
     """Transmite texto legible y termina con el reporte estructurado."""
@@ -160,11 +162,11 @@ async def chat_stream(
         if payload.target_system:
             prompt = f"Sistema objetivo: {payload.target_system}. {prompt}"
 
-        report = run_agent_workflow(
+        workflow = run_agent_workflow(
             analyst_prompt=prompt,
-            tech_store=technical_chunks,
-            stakeholder_store=operational_chunks
+            index=getattr(request.app.state, "index", None),
         )
+        report = await workflow if inspect.isawaitable(workflow) else workflow
         report["request_id"] = create_request_id()
         validated = ImpactReportResponse.model_validate(report)
         sources = get_unique_sources(validated)

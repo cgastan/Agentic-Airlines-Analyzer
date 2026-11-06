@@ -1,6 +1,7 @@
 # services/embeddings.py
 
 import os
+import asyncio
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
@@ -37,6 +38,19 @@ def get_embedding(text: str) -> list[float]:
 
     embedding = encoder.encode(text)
     return embedding.tolist()
+
+
+async def get_embedding_async(text: str) -> list[float]:
+    """Ejecuta embeddings locales sin bloquear el event loop."""
+    if EMBEDDING_PROVIDER == "openai":
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        response = await client.embeddings.create(
+            model=OPENAI_EMBEDDING_MODEL,
+            input=text,
+        )
+        return response.data[0].embedding
+    return await asyncio.to_thread(get_embedding, text)
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

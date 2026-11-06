@@ -90,6 +90,15 @@ class LLMImpactReport(BaseModel):
     insufficient_information: bool = False
 
 
+class RetrievalQueries(BaseModel):
+    """Subconsultas estructuradas producidas durante la inicialización."""
+
+    spec_query: str
+    stakeholder_query: str
+    extracted_systems: List[str] = Field(default_factory=list)
+    extracted_identifiers: List[str] = Field(default_factory=list)
+
+
 class ImpactReportResponse(BaseModel):
     """Estructura validada para el reporte de impacto final."""
     request_id: str

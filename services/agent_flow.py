@@ -7,7 +7,6 @@ from typing import TypedDict
 from groq import Groq
 from openai import OpenAI
 from dotenv import load_dotenv
-from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 from schemas.models import LLMImpactReport
 from services.rag import search_similar_chunks
@@ -116,7 +115,7 @@ def fallback_answer() -> str:
     Safely replies when technical dependencies or impact data cannot be confirmed.
     """
     print("[Agent Step] fallback_answer: Information could not be confirmed.")
-    return "I don't know based on the provided change requests and architecture documents."
+    return "I don't know based on the provided change requests and architecture documents"
 
 
 def classify_message_intent(message: str) -> str:
@@ -402,52 +401,63 @@ def route_after_grade(state: AgentState) -> str:
     return "rewrite"
 
 
-def build_impact_graph():
-    graph = StateGraph(AgentState)
-    graph.add_node("initialize", initialize_node)
-    graph.add_node("casual", casual_node)
-    graph.add_node("retrieve", retrieve_node)
-    graph.add_node("grade", grade_node)
-    graph.add_node("rewrite", rewrite_node)
-    graph.add_node("generate", generate_node)
-    graph.add_node("fallback", fallback_node)
-
-    graph.add_edge(START, "initialize")
-    graph.add_conditional_edges(
-        "initialize",
-        lambda state: "casual" if state["intent"] == "casual_chat" else "retrieve",
-        {"casual": "casual", "retrieve": "retrieve"},
-    )
-    graph.add_edge("casual", END)
-    graph.add_edge("retrieve", "grade")
-    graph.add_conditional_edges(
-        "grade",
-        route_after_grade,
-        {"generate": "generate", "rewrite": "rewrite", "fallback": "fallback"},
-    )
-    graph.add_edge("rewrite", "retrieve")
-    graph.add_edge("generate", END)
-    graph.add_edge("fallback", END)
-    return graph.compile()
-
-
-impact_graph = build_impact_graph()
-
-
-def run_agent_workflow(
+async def run_agent_workflow(
     analyst_prompt: str,
-    tech_store: list[dict],
-    stakeholder_store: list[dict],
+    index=None,
     allow_casual: bool = True,
 ) -> dict:
-    """Ejecuta el agente LangGraph y devuelve el reporte generado."""
-    final_state = impact_graph.invoke({
-        "original_query": analyst_prompt,
-        "tech_store": tech_store,
-        "stakeholder_store": stakeholder_store,
-        "allow_casual": allow_casual,
-    })
-    return final_state["report"]
+    """Ejecuta el pipeline nativo sin LangGraph."""
+    from services.embeddings import get_embedding_async
+
+    if allow_casual and classify_message_intent(analyst_prompt) == "casual_chat":
+        return casual_node({"original_query": analyst_prompt})["report"]
+    if index is None:
+        return fallback_node({"original_query": analyst_prompt})["report"]
+
+    spec_query = analyst_prompt
+    stakeholder_query = analyst_prompt
+    retrieved_technical = []
+    retrieved_stakeholder = []
+    retry_count = 0
+
+    while True:
+        from services.rag_service import retrieve_specifications_rag
+        from services.rag_service import retrieve_stakeholder_notes_rag
+
+        spec_embedding = await get_embedding_async(spec_query)
+        retrieved_technical = [
+            chunk.model_dump() for chunk in index.search(spec_query, spec_embedding)
+        ]
+        technical_ids = {chunk["id"] for chunk in retrieved_technical}
+
+        stakeholder_embedding = await get_embedding_async(stakeholder_query)
+        retrieved_stakeholder = [
+            chunk.model_dump() for chunk in index.search(
+                stakeholder_query, stakeholder_embedding, exclude_ids=technical_ids)
+        ]
+        combined = "\n".join(
+            chunk["text"] for chunk in retrieved_technical + retrieved_stakeholder
+        )
+        if grade_context(analyst_prompt, combined).strip().lower().startswith("yes"):
+            break
+        if retry_count >= 2:
+            return fallback_node({"original_query": analyst_prompt})["report"]
+        retry_count += 1
+        spec_query = rewrite_query(spec_query)
+        stakeholder_query = rewrite_query(stakeholder_query)
+
+    report = generate_impact_report(
+        analyst_prompt, retrieved_technical, retrieved_stakeholder)
+    report["sources"] = [
+        {
+            "document_id": chunk.get("source", ""),
+            "title": chunk.get("section") or chunk.get("source", ""),
+            "chunk_id": chunk.get("id"),
+        }
+        for chunk in retrieved_technical + retrieved_stakeholder
+    ]
+    return normalize_generated_report(
+        report, retrieved_technical + retrieved_stakeholder)
 
 
 print('Setup complete: Full agent workflow with professor requirements ready.')

@@ -1,12 +1,24 @@
 # main.py
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
+from services.ingestion_service import build_index
 from routers import analysis, chat
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # El índice se construye una vez al arrancar, nunca durante la importación.
+    app.state.index = await build_index()
+    yield
+
 
 app = FastAPI(
     title="Agentic Airlines - Impact Analyzer API",
     description="API para análisis automatizado de impacto de cambios para Business Analysts usando Groq y RAG local.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Registrar los routers separados de análisis y conversación

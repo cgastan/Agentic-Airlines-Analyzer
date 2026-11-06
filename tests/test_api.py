@@ -77,9 +77,9 @@ def test_analyze_stream_emits_real_steps_then_final(client):
 
 def test_documents_endpoint_adds_to_knowledge_base(client):
     response = client.post("/api/documents", files=[("files", ("notas.txt", b"Feedback de stakeholders de aeropuerto", "text/plain"))],
-                           data={"document_type": "stakeholder"})
+)
     assert response.status_code == 200, response.text
-    assert app.state.index.sources["notas.txt"] == "stakeholder"
+    assert app.state.index.sources["notas.txt"] >= 1
     assert (settings.DATA_DIR / "notas.txt").exists()
 
 

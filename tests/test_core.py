@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from config import settings
 from schemas.models import ImpactReportResponse
 from services import agent_flow
-from services.chunking import Chunk, chunk_pages, chunk_text, extract_identifiers
+from services.chunking import Chunk, chunk_pages, chunk_text
 from services.ingestion_service import build_index, extend_index
 from services.readers import UnsupportedFormatError, read_document
 from services.vector_store import HybridIndex, tokenize
@@ -33,11 +33,6 @@ def test_chunk_text_respects_size_and_overlap():
 
 def test_empty_text_produces_no_chunks():
     assert chunk_text(" \n\n ") == []
-
-
-def test_identifiers_are_detected_by_shape_not_by_hardcoded_values():
-    found = extract_identifiers("Según POL-GC-002, la Ley 18.331 e ISO 27001 aplican a XYZ-9.")
-    assert {"POL-GC-002", "Ley 18.331", "ISO 27001", "XYZ-9"} <= set(found)
 
 
 def test_tokenize_normalizes_accents_and_legal_numbers():
@@ -122,26 +117,21 @@ def test_unsupported_format_is_rejected():
 def _index(fake_vectors=True):
     from tests.conftest import FakeEncoder
     from services.readers import Page
-    chunks = (chunk_pages([Page(text=ARCH, source="arq.txt")], "specification")
-              + chunk_pages([Page(text=POLICY, source="pol.txt")], "policy"))
+    chunks = (chunk_pages([Page(text=ARCH, source="arq.txt")])
+              + chunk_pages([Page(text=POLICY, source="pol.txt")]))
     vectors = FakeEncoder().encode([c.context_text for c in chunks]).tolist()
     return HybridIndex(chunks, vectors), FakeEncoder()
 
 
-def test_search_filters_by_document_type():
+def test_search_excludes_already_retrieved_chunks():
     index, encoder = _index()
-    query = "aprobación de cambios"
-    results = index.search(query, encoder.encode([query])[0], doc_types={"specification"})
-    assert results and all(chunk.doc_type == "specification" for chunk in results)
+    first = index.search("reservas", encoder.encode(["reservas"])[0], top_k=1)
+    second = index.search("reservas", encoder.encode(["reservas"])[0], top_k=1,
+                          exclude_ids={first[0].id})
+    assert second and second[0].id != first[0].id
 
 
-def test_search_falls_back_to_all_documents_when_type_missing():
-    index, encoder = _index()
-    results = index.search("reservas", encoder.encode(["reservas"])[0], doc_types={"stakeholder"})
-    assert results
-
-
-def test_exact_identifier_ranks_first():
+def test_exact_code_ranks_first_via_bm25():
     index, encoder = _index()
     query = "POL-GC-002"
     assert index.search(query, encoder.encode([query])[0], top_k=1)[0].source == "pol.txt"
@@ -158,23 +148,13 @@ def test_merged_index_replaces_same_document_and_keeps_base():
 
 # ---------- Ingesta ----------
 
-def test_build_index_classifies_documents_by_content(fake_llm):
+def test_build_index_processes_every_document_the_same_way(fake_llm):
     (settings.DATA_DIR / "doc1.txt").write_text(ARCH, encoding="utf-8")
     (settings.DATA_DIR / "doc2.md").write_text(POLICY, encoding="utf-8")
+    (settings.DATA_DIR / "ignorado.xlsx").write_bytes(b"x")
     index = run(build_index())
-    assert index.sources == {"doc1.txt": "specification", "doc2.md": "policy"}
-
-    # Segunda construcción: clasificación cacheada, sin nuevas llamadas al LLM.
-    calls = len(fake_llm.calls)
-    run(build_index())
-    assert len(fake_llm.calls) == calls
-
-
-def test_manifest_overrides_classification(fake_llm):
-    (settings.DATA_DIR / "notas.txt").write_text(ARCH, encoding="utf-8")
-    (settings.DATA_DIR / "manifest.json").write_text('{"notas.txt": {"doc_type": "stakeholder"}}')
-    assert run(build_index()).sources == {"notas.txt": "stakeholder"}
-    assert "classify_document" not in fake_llm.calls
+    assert set(index.sources) == {"doc1.txt", "doc2.md"}
+    assert fake_llm.calls == []  # indexar no requiere llamadas al LLM
 
 
 def test_build_index_without_documents_returns_none():
@@ -198,9 +178,9 @@ def test_workflow_runs_all_steps_and_returns_valid_report(fake_llm):
         "grade_context", "generate_impact_report"]
     assert validated.risk_level.value == "Alto"
     assert not validated.insufficient_information
-    # Cada búsqueda consultó su propio tipo documental.
-    by_type = {s.doc_type for s in validated.sources}
-    assert {"specification", "policy"} <= by_type
+    # Las dos búsquedas aportan fragmentos distintos (sin duplicados).
+    ids = [s.chunk_id for s in validated.sources]
+    assert len(ids) == len(set(ids)) and {"arq.txt", "pol.txt"} <= {s.document_id for s in validated.sources}
 
 
 def test_workflow_rewrites_at_most_twice_then_reports_insufficient(fake_llm):

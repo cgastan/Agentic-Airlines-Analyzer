@@ -33,11 +33,6 @@ class FakeLLM:
         self.grade_sufficient = True
 
     async def __call__(self, prompt, system=None, **kwargs):
-        if "Clasifica el documento" in prompt:
-            self.calls.append("classify_document")
-            excerpt = prompt.split("Extracto:", 1)[-1]
-            doc_type = "policy" if re.search(r"pol[ií]tica", excerpt, re.I) else "specification"
-            return json.dumps({"doc_type": doc_type})
         if "Clasifica el mensaje" in prompt:
             self.calls.append("classify_intent")
             intent = "casual_chat" if "hola" in prompt.lower() else "impact_analysis"

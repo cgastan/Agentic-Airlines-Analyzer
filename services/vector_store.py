@@ -11,7 +11,7 @@ from rank_bm25 import BM25Okapi
 
 from config import settings
 from schemas.models import system_key
-from services.chunking import Chunk, extract_identifiers
+from services.chunking import Chunk
 
 
 def tokenize(text: str) -> list[str]:
@@ -34,9 +34,7 @@ def reciprocal_rank_fusion(rankings: Iterable[list[int]], k: int | None = None) 
 
 
 class HybridIndex:
-    """Matriz de embeddings normalizados + BM25 + bonus por identificadores exactos."""
-
-    IDENTIFIER_BONUS = 0.05
+    """Matriz de embeddings normalizados + BM25, combinados con RRF."""
 
     def __init__(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         if not chunks:
@@ -53,9 +51,9 @@ class HybridIndex:
         return len(self.chunks)
 
     @property
-    def sources(self) -> dict[str, str]:
-        """Documento -> tipo documental, para inspección vía API."""
-        return {chunk.source: chunk.doc_type for chunk in self.chunks}
+    def sources(self) -> dict[str, int]:
+        """Documento -> cantidad de fragmentos, para inspección vía API."""
+        return dict(Counter(chunk.source for chunk in self.chunks))
 
     def canonical_spelling(self, term: str) -> str | None:
         """Cómo escriben los documentos un término (p.ej. 'payhub' -> 'PayHub').
@@ -101,19 +99,15 @@ class HybridIndex:
         query: str,
         query_embedding: list[float],
         top_k: int = 5,
-        doc_types: set[str] | None = None,
         exclude_ids: set[str] | None = None,
     ) -> list[Chunk]:
-        """Búsqueda híbrida. doc_types restringe el corpus (p.ej. sólo especificaciones).
+        """Búsqueda híbrida sobre todos los documentos.
 
-        Si el filtro deja el corpus vacío, se busca en todos los documentos para no
-        devolver contexto vacío por una clasificación documental incompleta.
+        Similitud coseno (semántica) + BM25 (palabras y códigos exactos como
+        "POL-GC-002" o "Ley 17.250", que tokenize conserva como un solo token).
         """
         exclude_ids = exclude_ids or set()
-        available = [i for i, c in enumerate(self.chunks) if c.id not in exclude_ids]
-        candidates = [i for i in available if not doc_types or self.chunks[i].doc_type in doc_types]
-        if not candidates:
-            candidates = available
+        candidates = [i for i, c in enumerate(self.chunks) if c.id not in exclude_ids]
         if not candidates:
             return []
 
@@ -129,13 +123,5 @@ class HybridIndex:
             i for i in sorted(candidates, key=lambda i: -lexical_scores[i]) if lexical_scores[i] > 0
         ][:pool]
         scores = reciprocal_rank_fusion([dense_ranking, lexical_ranking])
-
-        # Un identificador exacto (ej. "ARQ-SIS-001") supera una distancia semántica desfavorable.
-        query_ids = {identifier.casefold() for identifier in extract_identifiers(query)}
-        if query_ids:
-            for i in candidates:
-                if query_ids & {x.casefold() for x in self.chunks[i].identifiers}:
-                    scores[i] = scores.get(i, 0.0) + self.IDENTIFIER_BONUS
-
         ranked = sorted(scores, key=lambda i: (-scores[i], i))
         return [self.chunks[i] for i in ranked[:top_k]]

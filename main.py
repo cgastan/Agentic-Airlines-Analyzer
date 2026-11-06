@@ -37,6 +37,39 @@ app.include_router(analysis.router)
 app.include_router(chat.router)
 
 
+BINARY = {"type": "string", "format": "binary"}
+
+
+def _is_upload(schema: dict) -> bool:
+    options = schema.get("anyOf", [schema])
+    return any(o.get("contentMediaType") == "application/octet-stream" for o in options)
+
+
+def custom_openapi() -> dict:
+    """Swagger UI sólo muestra el selector de archivos con `format: binary`.
+
+    FastAPI genera `contentMediaType` (estilo OpenAPI 3.1) y Swagger lo dibuja como una
+    caja de texto donde habría que pegar el contenido binario del archivo.
+    """
+    if app.openapi_schema is None:
+        schema = FastAPI.openapi(app)
+        for name, definition in schema.get("components", {}).get("schemas", {}).items():
+            if not name.startswith("Body_"):
+                continue
+            for prop in definition.get("properties", {}).values():
+                if _is_upload(prop):                                   # file: UploadFile | None
+                    for stale in ("anyOf", "contentMediaType"):
+                        prop.pop(stale, None)
+                    prop.update(BINARY)
+                elif prop.get("type") == "array" and _is_upload(prop.get("items", {})):
+                    prop["items"] = dict(BINARY)                       # files: list[UploadFile]
+        app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+
 @app.get("/")
 async def root():
     return {

@@ -67,7 +67,8 @@ class AgentState:
         if self.target_system:
             parts.append(f"Sistema objetivo indicado: {self.target_system}")
         if self.conversation_context:
-            parts.append(f"Contexto de la conversación previa:\n{self.conversation_context}")
+            parts.append(
+                f"Contexto de la conversación previa:\n{self.conversation_context}")
         if self.uploaded_text:
             parts.append(
                 "Documento de solicitud de cambio adjunto (extracto):\n"
@@ -99,10 +100,12 @@ Devuelve JSON con:
         data = await llm.complete_json(prompt, temperature=0, max_tokens=1200)
         details = ChangeDetails.model_validate(data)
     except (ValueError, ValidationError) as error:
-        logger.warning("initialize: respuesta inválida (%s); se usa la consulta original.", error)
+        logger.warning(
+            "initialize: respuesta inválida (%s); se usa la consulta original.", error)
         details = ChangeDetails(
             change_summary=state.analyst_prompt,
-            affected_systems=[state.target_system] if state.target_system else [],
+            affected_systems=[
+                state.target_system] if state.target_system else [],
             spec_query=state.analyst_prompt,
             stakeholder_query=state.analyst_prompt,
         )
@@ -124,20 +127,23 @@ Devuelve JSON con:
 
 def _with_entities(query: str, terms: list[str]) -> str:
     """Agrega a la consulta los sistemas/IDs extraídos que todavía no contiene."""
-    missing = [term for term in terms if term and term.casefold() not in query.casefold()]
+    missing = [term for term in terms if term and term.casefold()
+               not in query.casefold()]
     return " ".join([query, *missing]).strip()
 
 
 async def retrieve_specifications_rag(state: AgentState, index: HybridIndex | None) -> AgentState:
     """Busca componentes afectados y dependencias en arquitectura, procesos y solicitudes de cambio."""
-    terms = (state.details.affected_systems + state.details.identifiers) if state.details else []
+    terms = (state.details.affected_systems +
+             state.details.identifiers) if state.details else []
     state.tech_chunks = await rag.search_specifications(index, _with_entities(state.spec_query, terms))
     return state
 
 
 async def retrieve_stakeholder_notes_rag(state: AgentState, index: HybridIndex | None) -> AgentState:
     """Busca impactos operativos y organizacionales en notas de stakeholders y políticas."""
-    terms = (state.details.stakeholder_perspectives + state.details.identifiers) if state.details else []
+    terms = (state.details.stakeholder_perspectives +
+             state.details.identifiers) if state.details else []
     state.stakeholder_chunks = await rag.search_stakeholder_notes(
         index,
         _with_entities(state.stakeholder_query, terms),
@@ -153,7 +159,8 @@ async def grade_context(state: AgentState) -> AgentState:
     if not state.all_chunks:
         state.grade = ContextGrade(
             sufficient=False,
-            missing_information=["No se recuperó ningún fragmento relevante de la base documental."],
+            missing_information=[
+                "No se recuperó ningún fragmento relevante de la base documental."],
             reasoning="Recuperación vacía.",
         )
         return state
@@ -180,8 +187,10 @@ Devuelve JSON:
         state.grade = ContextGrade.model_validate(
             await llm.complete_json(prompt, temperature=0, max_tokens=800))
     except (ValueError, ValidationError) as error:
-        logger.warning("grade_context: respuesta inválida (%s); se asume suficiente.", error)
-        state.grade = ContextGrade(sufficient=True, reasoning="Evaluación no disponible.")
+        logger.warning(
+            "grade_context: respuesta inválida (%s); se asume suficiente.", error)
+        state.grade = ContextGrade(
+            sufficient=True, reasoning="Evaluación no disponible.")
     state.trace.grade = state.grade
     return state
 
@@ -215,7 +224,8 @@ Devuelve JSON: {{"spec_query": "...", "stakeholder_query": "..."}}"""
         queries = RewrittenQueries.model_validate(
             await llm.complete_json(prompt, temperature=0.3, max_tokens=800))
     except (ValueError, ValidationError) as error:
-        logger.warning("rewrite_query: respuesta inválida (%s); se amplía con lo faltante.", error)
+        logger.warning(
+            "rewrite_query: respuesta inválida (%s); se amplía con lo faltante.", error)
         extra = " ".join(missing)
         queries = RewrittenQueries(
             spec_query=f"{state.spec_query} {extra}".strip(),
@@ -290,9 +300,11 @@ Devuelve JSON con esta estructura:
     try:
         report = LLMImpactReport.model_validate(data).model_dump(mode="json")
     except ValidationError as error:
-        raise ValueError("El reporte generado no cumple el contrato de salida") from error
+        raise ValueError(
+            "El reporte generado no cumple el contrato de salida") from error
 
-    report["change_summary"] = details.get("change_summary", state.analyst_prompt)
+    report["change_summary"] = details.get(
+        "change_summary", state.analyst_prompt)
     report["insufficient_information"] = insufficient or not (
         report["technical_changes"] or report["affected_stakeholders"])
     report["missing_information"] = state.grade.missing_information if insufficient else []
@@ -314,7 +326,6 @@ def _sources(chunks: list[dict]) -> list[dict]:
             "title": chunk.get("section") or chunk["source"],
             "chunk_id": chunk["id"],
             "page": chunk.get("page"),
-            "doc_type": chunk.get("doc_type"),
         })
     return sources
 
@@ -334,7 +345,8 @@ async def run_agent_workflow_events(
     """Ejecuta el pipeline y emite un evento por paso; el último trae el reporte."""
     # Usa la grafía del corpus ('payhub' -> 'PayHub'); si no aparece, conserva lo escrito.
     if target_system and index is not None:
-        target_system = index.canonical_spelling(target_system) or target_system
+        target_system = index.canonical_spelling(
+            target_system) or target_system
 
     state = AgentState(
         analyst_prompt=analyst_prompt,

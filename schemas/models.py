@@ -110,7 +110,6 @@ class SourceReference(BaseModel):
     title: str
     chunk_id: Optional[str] = None
     page: Optional[int] = None
-    doc_type: Optional[str] = None
 
 
 class TechnicalChange(BaseModel):
@@ -188,7 +187,6 @@ class ChatResponse(BaseModel):
 
 class IngestedDocument(BaseModel):
     filename: str
-    doc_type: str
     chunks: int
 
 

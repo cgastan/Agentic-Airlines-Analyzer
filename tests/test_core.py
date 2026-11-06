@@ -287,3 +287,15 @@ def test_no_history_means_no_llm_calls(fake_llm):
     assert run(context_service.build_context([])) == ""
     assert run(context_service.standalone_query("hola", "")) == "hola"
     assert fake_llm.calls == []
+
+
+def test_build_index_fails_loudly_when_every_document_fails_to_embed(monkeypatch):
+    from services import ingestion_service
+
+    async def no_credit(_texts):
+        raise RuntimeError("insufficient_quota")
+
+    monkeypatch.setattr(ingestion_service, "embed_texts", no_credit)
+    (settings.DATA_DIR / "doc.txt").write_text(ARCH, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="insufficient_quota"):
+        run(build_index())

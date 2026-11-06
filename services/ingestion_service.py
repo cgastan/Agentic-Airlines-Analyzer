@@ -70,15 +70,23 @@ async def build_index(data_dir: Path | None = None) -> HybridIndex | None:
 
     chunks: list[Chunk] = []
     vectors: list[list[float]] = []
+    failures: dict[str, Exception] = {}
     for file in files:
         try:
             new_chunks, new_vectors = await _ingest_many([file])
         except Exception as error:  # un archivo dañado no impide indexar el resto
             logger.error("No se pudo ingerir %s: %s", file[0], error)
+            failures[file[0]] = error
             continue
         chunks += new_chunks
         vectors += new_vectors
 
+    if not chunks and failures:
+        # Todos fallaron (p.ej. OpenAI sin saldo o clave inválida): no arrancar con un índice
+        # vacío que luego responda "no hay documentación" sin explicar el motivo.
+        name, error = next(iter(failures.items()))
+        raise RuntimeError(
+            f"No se pudo indexar ningún documento de {data_dir}. Primer error ({name}): {error}")
     if not chunks:
         logger.warning("No hay documentos legibles en %s.", data_dir)
         return None

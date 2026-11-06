@@ -26,6 +26,10 @@ from services.readers import SUPPORTED_EXTENSIONS, read_document
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["Impact Analysis"])
 
+ANALYST_PROMPT_DESCRIPTION = (
+    "Descripción del cambio propuesto, o la instrucción de análisis si adjuntas un archivo "
+    "(ej.: 'Analiza el impacto de la solicitud adjunta')")
+ANALYST_PROMPT_EXAMPLES = ["Analiza el impacto de la solicitud de cambio adjunta"]
 FILE_DESCRIPTION = f"Documento ({', '.join(sorted(SUPPORTED_EXTENSIONS))}) con la solicitud de cambio u otra evidencia"
 
 
@@ -85,7 +89,8 @@ async def build_request_index(request: Request, upload):
 async def analyze_change_request(
     request: Request,
     analyst_prompt: str = Form(...,
-                               description="Descripción del cambio propuesto"),
+                               description=ANALYST_PROMPT_DESCRIPTION,
+                               examples=ANALYST_PROMPT_EXAMPLES),
     target_system: str | None = Form(None, description=TARGET_SYSTEM_DESCRIPTION,
                                      examples=TARGET_SYSTEM_EXAMPLES),
     file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
@@ -114,7 +119,8 @@ async def analyze_change_request(
 async def analyze_change_request_stream(
     request: Request,
     analyst_prompt: str = Form(...,
-                               description="Descripción del cambio propuesto"),
+                               description=ANALYST_PROMPT_DESCRIPTION,
+                               examples=ANALYST_PROMPT_EXAMPLES),
     target_system: str | None = Form(None, description=TARGET_SYSTEM_DESCRIPTION,
                                      examples=TARGET_SYSTEM_EXAMPLES),
     file: UploadFile | None = File(None, description=FILE_DESCRIPTION),
